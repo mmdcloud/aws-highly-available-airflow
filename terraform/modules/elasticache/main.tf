@@ -1,23 +1,16 @@
 resource "aws_elasticache_cluster" "cluster" {
-  cluster_id           = "cluster-example"
-  engine               = "redis"
-  node_type            = "cache.m4.large"
-  num_cache_nodes      = 1
-  parameter_group_name = "default.redis3.2"
-  engine_version       = "3.2.10"
-  port                 = 6379
+  cluster_id           = var.cluster_id
+  engine               = var.cluster_engine
+  node_type            = var.node_type
+  num_cache_nodes      = var.num_cache_nodes
+  parameter_group_name = var.parameter_group_name
+  engine_version       = var.engine_version
+  port                 = var.port
 }
 
 resource "aws_elasticache_subnet_group" "redis" {
   name       = "${var.cluster_name}-redis-subnet-group"
   subnet_ids = values(aws_subnet.private)[*].id
-}
-
-resource "aws_security_group" "redis_sg" {
-  name        = "${var.cluster_name}-redis-sg"
-  vpc_id      = aws_vpc.this.id
-  description = "Allow redis from airflow instances"
-  tags        = { Name = "redis-sg" }
 }
 
 resource "aws_elasticache_replication_group" "redis" {
