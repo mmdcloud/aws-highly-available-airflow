@@ -16,7 +16,6 @@ module "vpc" {
   single_nat_gateway      = false
   one_nat_gateway_per_az  = false
   tags = {
-    Environment = "${var.env}"
     Project     = "ha-airflow"
   }
 }
@@ -128,7 +127,7 @@ resource "aws_security_group" "airflow_webserver_asg_sg" {
     to_port         = 80
     protocol        = "tcp"
     cidr_blocks     = []
-    security_groups = [[aws_security_group.airflow_webserver_lb_sg.id]]
+    security_groups = [aws_security_group.airflow_webserver_lb_sg.id]
   }
 
   egress {
@@ -237,7 +236,7 @@ module "airflow_metadata_db" {
     module.vpc.private_subnets[1],
     module.vpc.private_subnets[2]
   ]
-  vpc_security_group_ids                = [module.carshub_rds_sg.id]
+  vpc_security_group_ids                = [module.rds_sg.id]
   publicly_accessible                   = false
   deletion_protection                   = false
   skip_final_snapshot                   = true
