@@ -16,7 +16,7 @@ module "vpc" {
   single_nat_gateway      = false
   one_nat_gateway_per_az  = false
   tags = {
-    Project     = "ha-airflow"
+    Project = "ha-airflow"
   }
 }
 
@@ -220,17 +220,20 @@ module "airflow_metadata_db" {
   source                          = "./modules/rds"
   db_name                         = "airflow-metadata-db"
   allocated_storage               = 100
+  max_allocated_storage           = 1000
   storage_type                    = "gp3"
-  engine                          = "mysql"
-  engine_version                  = "8.0.40"
+  engine                          = "postgres"
+  engine_version                  = "15.4"
   instance_class                  = "db.r6g.large"
   multi_az                        = true
+  storage_encrypted               = true
   username                        = tostring(data.vault_generic_secret.rds.data["username"])
   password                        = tostring(data.vault_generic_secret.rds.data["password"])
   subnet_group_name               = "airflow-metadata-db-subnet-group"
-  enabled_cloudwatch_logs_exports = ["audit", "error", "general", "slowquery"]
-  backup_retention_period         = 35
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  backup_retention_period         = 30
   backup_window                   = "03:00-06:00"
+  maintenance_window              = "mon:04:00-mon:05:00"
   subnet_group_ids = [
     module.vpc.private_subnets[0],
     module.vpc.private_subnets[1],
@@ -240,25 +243,28 @@ module "airflow_metadata_db" {
   publicly_accessible                   = false
   deletion_protection                   = false
   skip_final_snapshot                   = true
-  max_allocated_storage                 = 500
   performance_insights_enabled          = true
   performance_insights_retention_period = 7
   monitoring_interval                   = 60
   monitoring_role_arn                   = aws_iam_role.rds_monitoring_role.arn
   parameter_group_name                  = "airflow-metadata-db-pg"
-  parameter_group_family                = "mysql8.0"
+  parameter_group_family                = "postgres15"
   parameters = [
     {
       name  = "max_connections"
+      value = "500"
+    },
+    {
+      name  = "shared_buffers"
+      value = "{DBInstanceClassMemory/10240}"
+    },
+    {
+      name  = "effective_cache_size"
+      value = "{DBInstanceClassMemory/5120}"
+    },
+    {
+      name  = "log_min_duration_statement"
       value = "1000"
-    },
-    {
-      name  = "innodb_buffer_pool_size"
-      value = "{DBInstanceClassMemory*3/4}"
-    },
-    {
-      name  = "slow_query_log"
-      value = "1"
     }
   ]
 }

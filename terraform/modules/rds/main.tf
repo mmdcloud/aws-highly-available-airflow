@@ -7,6 +7,7 @@ resource "aws_db_instance" "db" {
   multi_az                              = var.multi_az
   instance_class                        = var.instance_class
   username                              = var.username
+  storage_encrypted                     = var.storage_encrypted
   storage_type                          = var.storage_type
   password                              = var.password
   max_allocated_storage                 = var.max_allocated_storage
@@ -16,10 +17,11 @@ resource "aws_db_instance" "db" {
   monitoring_role_arn                   = var.monitoring_role_arn
   parameter_group_name                  = aws_db_parameter_group.parameter_group.name
   backup_retention_period               = 7
-  backup_window                         = "03:00-05:00"
+  backup_window                         = var.backup_window
   deletion_protection                   = var.deletion_protection
   enabled_cloudwatch_logs_exports       = var.enabled_cloudwatch_logs_exports
   skip_final_snapshot                   = var.skip_final_snapshot
+  maintenance_window                    = var.maintenance_window
   db_subnet_group_name                  = aws_db_subnet_group.rds_subnet_group.name
   vpc_security_group_ids                = var.vpc_security_group_ids
   tags = {

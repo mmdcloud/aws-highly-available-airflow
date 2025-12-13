@@ -6,9 +6,11 @@ variable "publicly_accessible" {}
 variable "multi_az" {}
 variable "instance_class" {}
 variable "username" {}
+variable "storage_encrypted" {}
 variable "password" {}
 variable "parameter_group_name" {}
 variable "parameter_group_family" {}
+variable "maintenance_window" {}
 variable "parameters" {
   type = list(object({
     name  = string
