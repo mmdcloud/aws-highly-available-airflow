@@ -297,8 +297,6 @@ module "airflow_webserver_lb_logs" {
 # -----------------------------------------------------------------------------------------
 # RDS Configuration ( Database for storing Metadata of Airflow )
 # -----------------------------------------------------------------------------------------
-
-# RDS Enhanced Monitoring Role
 resource "aws_iam_role" "rds_monitoring_role" {
   name = "airflow-rds-monitoring-role"
 
@@ -888,7 +886,8 @@ resource "aws_appautoscaling_policy" "worker_scale_up" {
 # -----------------------------------------------------------------------------------------
 # Cloudwatch Alarm Configuration
 # -----------------------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
+module "rds_cpu" {
+  source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-rds-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
@@ -899,14 +898,13 @@ resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
   threshold           = "80"
   alarm_description   = "RDS CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
-
   dimensions = {
     DBInstanceIdentifier = module.airflow_metadata_db.id
   }
 }
 
-# RDS Connection Count Alarm
-resource "aws_cloudwatch_metric_alarm" "rds_connections" {
+module "rds_connections" {
+  source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-rds-high-connections"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
@@ -917,14 +915,13 @@ resource "aws_cloudwatch_metric_alarm" "rds_connections" {
   threshold           = "400"
   alarm_description   = "RDS connection count is too high"
   alarm_actions       = [module.alarm_notifications.arn]
-
   dimensions = {
     DBInstanceIdentifier = module.airflow_metadata_db.id
   }
 }
 
-# Redis CPU Alarm
-resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
+module "redis_cpu" {
+  source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-redis-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
@@ -935,14 +932,13 @@ resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
   threshold           = "75"
   alarm_description   = "Redis CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
-
   dimensions = {
     CacheClusterId = aws_elasticache_replication_group.airflow.id
   }
 }
 
-# ECS Service CPU Alarm (Scheduler)
-resource "aws_cloudwatch_metric_alarm" "scheduler_cpu" {
+module "scheduler_cpu" {
+  source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-scheduler-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
@@ -953,7 +949,6 @@ resource "aws_cloudwatch_metric_alarm" "scheduler_cpu" {
   threshold           = "80"
   alarm_description   = "Scheduler CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
-
   dimensions = {
     ClusterName = aws_ecs_cluster.airflow.name
     ServiceName = aws_ecs_service.scheduler.name
@@ -961,7 +956,8 @@ resource "aws_cloudwatch_metric_alarm" "scheduler_cpu" {
 }
 
 # ALB Target Health Alarm
-resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_targets" {
+module "alb_unhealthy_targets" {
+  source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-alb-unhealthy-targets"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
@@ -972,7 +968,6 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_targets" {
   threshold           = "0"
   alarm_description   = "Unhealthy targets detected in ALB"
   alarm_actions       = [module.alarm_notifications.arn]
-
   dimensions = {
     LoadBalancer = aws_lb.airflow.arn_suffix
     TargetGroup  = aws_lb_target_group.webserver.arn_suffix
