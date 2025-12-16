@@ -1,4 +1,15 @@
 # -----------------------------------------------------------------------------------------
+# Registering vault provider
+# -----------------------------------------------------------------------------------------
+data "vault_generic_secret" "rds" {
+  path = "secret/rds"
+}
+
+data "vault_generic_secret" "redis" {
+  path = "secret/redis"
+}
+
+# -----------------------------------------------------------------------------------------
 # VPC Configuration
 # -----------------------------------------------------------------------------------------
 module "vpc" {
@@ -394,7 +405,7 @@ module "airflow_redis_cache" {
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   auth_token_enabled         = true
-  auth_token                 = var.redis_auth_token
+  auth_token                 = tostring(data.vault_generic_secret.redis.data["auth_token"])
 
   log_delivery_configuration = [
     {
@@ -619,9 +630,9 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${var.redis_auth_token}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${aws_s3_bucket.airflow_logs.id}" },
             { name = "AIRFLOW__WEBSERVER__BASE_URL", value = "https://${var.domain_name}" },
@@ -717,9 +728,9 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${var.redis_auth_token}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${aws_s3_bucket.airflow_logs.id}" },
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" }
@@ -814,9 +825,9 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${var.redis_auth_token}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.airflow_metadata.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${aws_elasticache_replication_group.airflow.configuration_endpoint_address}:6379/0" },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${aws_s3_bucket.airflow_logs.id}" },
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" }
