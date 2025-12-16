@@ -32,176 +32,191 @@ module "vpc" {
 }
 
 # Security Group
-resource "aws_security_group" "airflow_scheduler_sg" {
-  name   = "airflow-scheduler-asg-sg"
+module "airflow_scheduler_sg" {
+  source = "./modules/security-groups"
+  name   = "airflow-scheduler-sg"
   vpc_id = module.vpc.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
-    Name = "airflow-scheduler-asg-sg"
+    Name = "airflow-scheduler-sg"
   }
 }
 
-resource "aws_security_group" "airflow_worker_sg" {
+module "airflow_worker_sg" {
+  source = "./modules/security-groups"
   name   = "airflow-worker-sg"
   vpc_id = module.vpc.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-worker-sg"
   }
 }
 
-resource "aws_security_group" "airflow_webserver_lb_sg" {
+module "airflow_webserver_lb_sg" {
+  source = "./modules/security-groups"
   name   = "airflow-webserver-lb-sg"
   vpc_id = module.vpc.vpc_id
-
-  ingress {
-    description = "HTTP traffic"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS traffic"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+  ingress_rules = [
+    {
+      description = "HTTP Traffic"
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    },
+    {
+      description = "HTTPS Traffic"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-webserver-lb-sg"
   }
 }
 
-resource "aws_security_group" "airflow_webserver_sg" {
+module "airflow_webserver_sg" {
+  source = "./modules/security-groups"
   name   = "airflow-webserver-sg"
   vpc_id = module.vpc.vpc_id
-
-  ingress {
-    description = "HTTP traffic"
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = [aws_security_group.airflow_webserver_lb_sg.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+  ingress_rules = [
+    {
+      description = "HTTP Traffic"
+      from_port   = 8080
+      to_port     = 8080
+      protocol    = "tcp"
+      cidr_blocks = [module.airflow_webserver_lb_sg.id]
+    }
+  ]
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-webserver-sg"
   }
 }
 
-resource "aws_security_group" "airflow_rds_sg" {
-  name        = "airflow-rds-sg"
-  description = "Security group for Airflow RDS"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port = 5432
-    to_port   = 5432
-    protocol  = "tcp"
-    security_groups = [
-      aws_security_group.airflow_webserver_sg.id,
-      aws_security_group.airflow_scheduler_sg.id,
-      aws_security_group.airflow_worker_sg.id
-    ]
-    description = "PostgreSQL from Airflow components"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+module "airflow_rds_sg" {
+  source = "./modules/security-groups"
+  name   = "airflow-rds-sg"
+  vpc_id = module.vpc.vpc_id
+  ingress_rules = [
+    {
+      description = "PostgreSQL from Airflow components"
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      security_groups = [
+        module.airflow_webserver_sg.id,
+        module.airflow_scheduler_sg.id,
+        module.airflow_worker_sg.id
+      ]
+    }
+  ]
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-rds-sg"
   }
 }
 
-resource "aws_security_group" "airflow_redis_sg" {
-  name        = "airflow-redis-sg"
-  description = "Security group for Airflow Redis"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port = 6379
-    to_port   = 6379
-    protocol  = "tcp"
-    security_groups = [
-      aws_security_group.airflow_webserver_sg.id,
-      aws_security_group.airflow_scheduler_sg.id,
-      aws_security_group.airflow_worker_sg.id
-    ]
-    description = "Redis from Airflow components"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+module "airflow_redis_sg" {
+  source = "./modules/security-groups"
+  name   = "airflow-redis-sg"
+  vpc_id = module.vpc.vpc_id
+  ingress_rules = [
+    {
+      description = "Redis from Airflow components"
+      from_port   = 6379
+      to_port     = 6379
+      protocol    = "tcp"
+      security_groups = [
+        module.airflow_webserver_sg.id,
+        module.airflow_scheduler_sg.id,
+        module.airflow_worker_sg.id
+      ]
+    }
+  ]
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-redis-sg"
   }
 }
 
-resource "aws_security_group" "airflow_efs_sg" {
-  name        = "airflow-efs-sg"
-  description = "Security group for Airflow EFS"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port = 2049
-    to_port   = 2049
-    protocol  = "tcp"
-    security_groups = [
-      aws_security_group.airflow_webserver_sg.id,
-      aws_security_group.airflow_scheduler_sg.id,
-      aws_security_group.airflow_worker_sg.id
-    ]
-    description = "NFS from Airflow components"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+module "airflow_efs_sg" {
+  source = "./modules/security-groups"
+  name   = "airflow-efs-sg"
+  vpc_id = module.vpc.vpc_id
+  ingress_rules = [
+    {
+      description = "NFS from Airflow components"
+      from_port   = 2049
+      to_port     = 2049
+      protocol    = "tcp"
+      security_groups = [
+        module.airflow_webserver_sg.id,
+        module.airflow_scheduler_sg.id,
+        module.airflow_worker_sg.id
+      ]
+    }
+  ]
+  egress_rules = [
+    {
+      description = "Allow all outbound traffic"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
   tags = {
     Name = "airflow-efs-sg"
   }
@@ -422,8 +437,8 @@ module "airflow_redis_cache" {
     module.vpc.private_subnets[2]
   ]
 
-  description                = ""
-  replication_group_id       = ""
+  description                = "Airflow Redis Cache Cluster"
+  replication_group_id       = "airflow-redis"
   vpc_security_group_ids     = [aws_security_group.airflow_redis_sg.id]
   maintenance_window         = "sun:05:00-sun:09:00"
   port                       = 6379
@@ -966,7 +981,6 @@ module "scheduler_cpu" {
   }
 }
 
-# ALB Target Health Alarm
 module "alb_unhealthy_targets" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
   alarm_name          = "airflow-alb-unhealthy-targets"
@@ -985,6 +999,9 @@ module "alb_unhealthy_targets" {
   }
 }
 
+# -----------------------------------------------------------------------------------------
+# SNS Configuration
+# -----------------------------------------------------------------------------------------
 module "alarm_notifications" {
   source     = "./modules/sns"
   topic_name = "ha-airflow-cloudwatch-alarm-notification-topic"

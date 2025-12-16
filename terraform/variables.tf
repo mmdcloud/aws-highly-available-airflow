@@ -16,3 +16,8 @@ variable "azs" {
   type        = list(string)
   description = "Availability Zones"
 }
+
+variable "domain_name" {
+  type        = string
+  description = "Domain name for the Airflow webserver"
+}
