@@ -1,3 +1,8 @@
-output "cluster_id" {
-  value = aws_elasticache_cluster.cluster.id
+output "id" {
+  value = aws_elasticache_replication_group.replication_group.id
 }
+
+output "configuration_endpoint_address" {
+  value = aws_elasticache_replication_group.replication_group.configuration_endpoint_address 
+}
+
