@@ -363,7 +363,7 @@ module "airflow_metadata_db" {
   source                          = "./modules/rds"
   db_name                         = "airflow-metadata-db"
   allocated_storage               = 100
-  max_allocated_storage           = 1000
+  max_allocated_storage           = 200
   storage_type                    = "gp3"
   engine                          = "postgres"
   engine_version                  = "15.4"
