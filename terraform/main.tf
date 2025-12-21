@@ -664,7 +664,6 @@ module "ha_airflow_ecs_cluster" {
         cpu_architecture        = "X86_64"
         operating_system_family = "LINUX"
       }
-      launch_type              = "FARGATE"
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
       container_definitions = {
@@ -749,6 +748,7 @@ module "ha_airflow_ecs_cluster" {
       }
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
+      security_group_ids            = [module.airflow_webserver_sg.id]
       availability_zone_rebalancing = "ENABLED"
     }
 
@@ -768,7 +768,6 @@ module "ha_airflow_ecs_cluster" {
         cpu_architecture        = "X86_64"
         operating_system_family = "LINUX"
       }
-      launch_type              = "FARGATE"
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
       container_definitions = {
@@ -847,6 +846,7 @@ module "ha_airflow_ecs_cluster" {
       }
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
+      security_group_ids            = [module.airflow_scheduler_sg.id]
       availability_zone_rebalancing = "ENABLED"
     }
 
@@ -866,7 +866,6 @@ module "ha_airflow_ecs_cluster" {
         cpu_architecture        = "X86_64"
         operating_system_family = "LINUX"
       }
-      launch_type              = "FARGATE"
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
       container_definitions = {
@@ -945,6 +944,7 @@ module "ha_airflow_ecs_cluster" {
       }
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
+      security_group_ids            = [module.airflow_worker_sg.id]
       availability_zone_rebalancing = "ENABLED"
     }
   }
