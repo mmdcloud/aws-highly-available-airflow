@@ -873,26 +873,24 @@ module "ha_airflow_ecs_cluster" {
 # -----------------------------------------------------------------------------------------
 # Auto Scaling Configuration
 # -----------------------------------------------------------------------------------------
-resource "aws_appautoscaling_target" "worker" {
-  max_capacity       = 20
-  min_capacity       = 3
-  resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${aws_ecs_service.worker.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
-
-resource "aws_appautoscaling_policy" "worker_scale_up" {
-  name               = "worker-scale-up"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.worker.resource_id
-  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.worker.service_namespace
-  target_tracking_scaling_policy_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+module "worker_auto_scaling" {
+  source                   = "./modules/autoscaling"
+  service_namespace        = "ecs"
+  resource_id              = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${aws_ecs_service.worker.name}"
+  scalable_dimension       = "ecs:service:DesiredCount"
+  min_capacity             = 3
+  max_capacity             = 20
+  policies = {
+    name = "worker-scale-up"
+    policy_type = "TargetTrackingScaling"
+    target_tracking_scaling_policy_configuration = {
+      predefined_metric_specification = {
+        predefined_metric_type = "ECSServiceAverageCPUUtilization"
+      }
+      target_value = 70.0
     }
-    target_value = 70.0
   }
+  
 }
 
 # -----------------------------------------------------------------------------------------
