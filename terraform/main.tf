@@ -206,38 +206,6 @@ module "airflow_redis_sg" {
   }
 }
 
-module "airflow_efs_sg" {
-  source = "./modules/security-groups"
-  name   = "airflow-efs-sg"
-  vpc_id = module.vpc.vpc_id
-  ingress_rules = [
-    {
-      description = "NFS from Airflow components"
-      from_port   = 2049
-      to_port     = 2049
-      protocol    = "tcp"
-      security_groups = [
-        module.airflow_webserver_sg.id,
-        module.airflow_scheduler_sg.id,
-        module.airflow_worker_sg.id
-      ]
-      cidr_blocks = []
-    }
-  ]
-  egress_rules = [
-    {
-      description = "Allow all outbound traffic"
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  ]
-  tags = {
-    Name = "airflow-efs-sg"
-  }
-}
-
 # -----------------------------------------------------------------------------------------
 # Secrets manager configuration
 # -----------------------------------------------------------------------------------------
@@ -514,7 +482,7 @@ module "webserver_lb" {
 # ECS Configuration
 # -----------------------------------------------------------------------------------------
 module "ecs_task_execution_role" {
-  source             = "../../../modules/iam"
+  source             = "./modules/iam"
   role_name          = "ecs-task-execution-role"
   role_description   = "IAM role for ECS task execution"
   policy_name        = "ecs-task-execution-policy"
@@ -540,9 +508,10 @@ module "ecs_task_execution_role" {
         "Statement": [
             {
                 "Action": [
-                  "s3:PutObject"
+                  "s3:PutObject",
+                  "s3:GetObject"
                 ],
-                "Resource": "*",
+                "Resource": "${module.airflow_dags_bucket.arn}/*",
                 "Effect": "Allow"
             },
             {
@@ -562,6 +531,24 @@ module "ecs_task_execution_role" {
 resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy_attachment" {
   role       = module.ecs_task_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+module "webserver_log_group" {
+  source            = "./modules/cloudwatch/cloudwatch-log-group"
+  log_group_name    = "/aws/ecs/airflow/webserver"
+  retention_in_days = 7
+}
+
+module "scheduler_log_group" {
+  source            = "./modules/cloudwatch/cloudwatch-log-group"
+  log_group_name    = "/aws/ecs/airflow/scheduler"
+  retention_in_days = 7
+}
+
+module "worker_log_group" {
+  source            = "./modules/cloudwatch/cloudwatch-log-group"
+  log_group_name    = "/aws/ecs/airflow/worker"
+  retention_in_days = 7
 }
 
 module "ha_airflow_ecs_cluster" {
@@ -628,6 +615,7 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -643,12 +631,11 @@ module "ha_airflow_ecs_cluster" {
           }]
           # enable_cloudwatch_logging = false
           logConfiguration = {
-            logDriver = "awsfirelens"
+            logDriver = "awslogs"
             options = {
-              Name                    = "firehose"
-              region                  = var.region
-              delivery_stream         = "webserver-stream"
-              log-driver-buffer-limit = "2097152"
+              awslogs-group         = module.webserver_log_group.log_group_name
+              awslogs-region        = var.region
+              awslogs-stream-prefix = "webserver"
             }
           }
           memoryReservation = 100
@@ -727,6 +714,7 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -748,12 +736,11 @@ module "ha_airflow_ecs_cluster" {
             condition     = "START"
           }]
           logConfiguration = {
-            logDriver = "awsfirelens"
+            logDriver = "awslogs"
             options = {
-              Name                    = "firehose"
-              region                  = var.region
-              delivery_stream         = "scheduler-stream"
-              log-driver-buffer-limit = "2097152"
+              awslogs-group         = module.scheduler_log_group.log_group_name
+              awslogs-region        = var.region
+              awslogs-stream-prefix = "scheduler"
             }
           }
           memoryReservation = 100
@@ -825,6 +812,7 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -846,12 +834,11 @@ module "ha_airflow_ecs_cluster" {
             condition     = "START"
           }]
           logConfiguration = {
-            logDriver = "awsfirelens"
+            logDriver = "awslogs"
             options = {
-              Name                    = "firehose"
-              region                  = var.region
-              delivery_stream         = "worker-stream"
-              log-driver-buffer-limit = "2097152"
+              awslogs-group         = module.worker_log_group.log_group_name
+              awslogs-region        = var.region
+              awslogs-stream-prefix = "worker"
             }
           }
           memoryReservation = 100
@@ -874,14 +861,14 @@ module "ha_airflow_ecs_cluster" {
 # Auto Scaling Configuration
 # -----------------------------------------------------------------------------------------
 module "worker_auto_scaling" {
-  source                   = "./modules/autoscaling"
-  service_namespace        = "ecs"
-  resource_id              = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${aws_ecs_service.worker.name}"
-  scalable_dimension       = "ecs:service:DesiredCount"
-  min_capacity             = 3
-  max_capacity             = 20
+  source             = "./modules/autoscaling"
+  service_namespace  = "ecs"
+  resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["worker"].name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  min_capacity       = 3
+  max_capacity       = 20
   policies = {
-    name = "worker-scale-up"
+    name        = "worker-scale-up"
     policy_type = "TargetTrackingScaling"
     target_tracking_scaling_policy_configuration = {
       predefined_metric_specification = {
@@ -890,7 +877,7 @@ module "worker_auto_scaling" {
       target_value = 70.0
     }
   }
-  
+
 }
 
 # -----------------------------------------------------------------------------------------
@@ -975,7 +962,7 @@ module "scheduler_cpu" {
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
     ClusterName = module.ha_airflow_ecs_cluster.cluster_name
-    ServiceName = aws_ecs_service.scheduler.name
+    ServiceName = module.ha_airflow_ecs_cluster.services["scheduler"].name
   }
 }
 
@@ -992,7 +979,10 @@ module "alb_unhealthy_targets" {
   alarm_description   = "Unhealthy targets detected in ALB"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
-    LoadBalancer = aws_lb.airflow.arn_suffix
-    TargetGroup  = aws_lb_target_group.webserver.arn_suffix
+    LoadBalancer = module.webserver_lb.lb_arn
+    TargetGroup = element(
+      split("loadbalancer/", module.webserver_lb.lb_arn),
+      1
+    )
   }
 }
