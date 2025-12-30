@@ -9,10 +9,6 @@ data "vault_generic_secret" "redis" {
   path = "secret/redis"
 }
 
-data "aws_ssm_parameter" "fluentbit" {
-  name = "/aws/service/aws-for-fluent-bit/stable"
-}
-
 resource "random_id" "id" {
   byte_length = 8
 }
@@ -27,6 +23,8 @@ module "vpc" {
   azs                     = var.azs
   public_subnets          = var.public_subnets
   private_subnets         = var.private_subnets
+  database_subnets        = var.database_subnets
+  elasticache_subnets     = var.elasticache_subnets
   enable_dns_hostnames    = true
   enable_dns_support      = true
   create_igw              = true
@@ -346,9 +344,9 @@ module "airflow_metadata_db" {
   backup_window                   = "03:00-06:00"
   maintenance_window              = "mon:04:00-mon:05:00"
   subnet_group_ids = [
-    module.vpc.private_subnets[0],
-    module.vpc.private_subnets[1],
-    module.vpc.private_subnets[2]
+    module.vpc.database_subnets[0],
+    module.vpc.database_subnets[1],
+    module.vpc.database_subnets[2]
   ]
   vpc_security_group_ids                = [module.airflow_rds_sg.id]
   publicly_accessible                   = false
@@ -413,16 +411,16 @@ module "airflow_redis_cache" {
     }
   ]
   subnet_group_ids = [
-    module.vpc.private_subnets[0],
-    module.vpc.private_subnets[1],
-    module.vpc.private_subnets[2]
+    module.vpc.elasticache_subnets[0],
+    module.vpc.elasticache_subnets[1],
+    module.vpc.elasticache_subnets[2]
   ]
   description                = "Airflow Redis Cache Cluster"
   replication_group_id       = "airflow-redis"
   vpc_security_group_ids     = [module.airflow_redis_sg.id]
   maintenance_window         = "sun:05:00-sun:09:00"
   port                       = 6379
-  automatic_failover_enabled = false
+  automatic_failover_enabled = true
 }
 
 # -----------------------------------------------------------------------------------------
@@ -457,7 +455,7 @@ module "webserver_lb" {
   target_groups = {
     webserver_lb_target_group = {
       backend_protocol = "HTTP"
-      backend_port     = 3000
+      backend_port     = 8080
       target_type      = "ip"
       vpc_id           = module.vpc.vpc_id
       health_check = {
@@ -465,7 +463,7 @@ module "webserver_lb" {
         healthy_threshold   = 3
         interval            = 30
         path                = "/"
-        port                = 3000
+        port                = 8080
         protocol            = "HTTP"
         unhealthy_threshold = 3
       }
@@ -481,7 +479,99 @@ module "webserver_lb" {
 # -----------------------------------------------------------------------------------------
 # ECS Configuration
 # -----------------------------------------------------------------------------------------
-module "ecs_task_execution_role" {
+module "airflow_webserver_task_execution_role" {
+  source             = "./modules/iam"
+  role_name          = "ecs-task-execution-role"
+  role_description   = "IAM role for ECS task execution"
+  policy_name        = "ecs-task-execution-policy"
+  policy_description = "IAM policy for ECS task execution"
+  assume_role_policy = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "sts:AssumeRole",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Effect": "Allow",
+                "Sid": ""
+            }
+        ]
+    }
+    EOF
+  policy             = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": [
+                  "s3:PutObject",
+                  "s3:GetObject"
+                ],
+                "Resource": "${module.airflow_dags_bucket.arn}/*",
+                "Effect": "Allow"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+              ],
+              "Resource": "${module.metadata_db_credentials.arn}"
+            }
+        ]
+    }
+    EOF
+}
+
+module "airflow_scheduler_task_execution_role" {
+  source             = "./modules/iam"
+  role_name          = "ecs-task-execution-role"
+  role_description   = "IAM role for ECS task execution"
+  policy_name        = "ecs-task-execution-policy"
+  policy_description = "IAM policy for ECS task execution"
+  assume_role_policy = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "sts:AssumeRole",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Effect": "Allow",
+                "Sid": ""
+            }
+        ]
+    }
+    EOF
+  policy             = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": [
+                  "s3:PutObject",
+                  "s3:GetObject"
+                ],
+                "Resource": "${module.airflow_dags_bucket.arn}/*",
+                "Effect": "Allow"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+              ],
+              "Resource": "${module.metadata_db_credentials.arn}"
+            }
+        ]
+    }
+    EOF
+}
+
+module "airflow_worker_task_execution_role" {
   source             = "./modules/iam"
   role_name          = "ecs-task-execution-role"
   role_description   = "IAM role for ECS task execution"
@@ -533,6 +623,7 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy_attach
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# Cloudwatch Log Groups for ECS tasks
 module "webserver_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
   log_group_name    = "/aws/ecs/airflow/webserver"
@@ -558,8 +649,8 @@ module "ha_airflow_ecs_cluster" {
     webserver = {
       cpu                    = 2048
       memory                 = 4096
-      task_exec_iam_role_arn = module.ecs_task_execution_role.arn
-      iam_role_arn           = module.ecs_task_execution_role.arn
+      task_exec_iam_role_arn = module.airflow_webserver_task_execution_role.arn
+      iam_role_arn           = module.airflow_webserver_task_execution_role.arn
       desired_count          = 2
       launch_type            = "FARGATE"
       assign_public_ip       = false
@@ -573,19 +664,7 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {
-        fluent-bit = {
-          cpu       = 512
-          memory    = 1024
-          essential = true
-          image     = nonsensitive(data.aws_ssm_parameter.fluentbit.value)
-          user      = "0"
-          firelensConfiguration = {
-            type = "fluentbit"
-          }
-          memoryReservation                      = 50
-          cloudwatch_log_group_retention_in_days = 30
-        }
+      container_definitions = {        
         webserver = {
           cpu       = 1024
           memory    = 2048
@@ -620,20 +699,16 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.id}" },
-            { name = "AIRFLOW__WEBSERVER__BASE_URL", value = "https://${var.domain_name}" },
+            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+            # { name = "AIRFLOW__WEBSERVER__BASE_URL", value = "https://${var.domain_name}" },
             { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" }
           ]
-          readonlyRootFilesystem = false
-          dependsOn = [{
-            containerName = "fluent-bit"
-            condition     = "START"
-          }]
-          # enable_cloudwatch_logging = false
+          readonlyRootFilesystem = false          
+          enable_cloudwatch_logging = true
           logConfiguration = {
             logDriver = "awslogs"
             options = {
-              awslogs-group         = module.webserver_log_group.log_group_name
+              awslogs-group         = module.webserver_log_group.name
               awslogs-region        = var.region
               awslogs-stream-prefix = "webserver"
             }
@@ -650,7 +725,7 @@ module "ha_airflow_ecs_cluster" {
         service = {
           target_group_arn = module.webserver_lb.target_groups["webserver_lb_target_group"].arn
           container_name   = "webserver"
-          container_port   = 3000
+          container_port   = 8080
         }
       }
       subnet_ids                    = module.vpc.private_subnets
@@ -662,8 +737,8 @@ module "ha_airflow_ecs_cluster" {
     scheduler = {
       cpu                    = 2048
       memory                 = 4096
-      task_exec_iam_role_arn = module.ecs_task_execution_role.arn
-      iam_role_arn           = module.ecs_task_execution_role.arn
+      task_exec_iam_role_arn = module.airflow_scheduler_task_execution_role.arn
+      iam_role_arn           = module.airflow_scheduler_task_execution_role.arn
       desired_count          = 2
       launch_type            = "FARGATE"
       assign_public_ip       = false
@@ -677,19 +752,7 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {
-        fluent-bit = {
-          cpu       = 512
-          memory    = 1024
-          essential = true
-          image     = nonsensitive(data.aws_ssm_parameter.fluentbit.value)
-          user      = "0"
-          firelensConfiguration = {
-            type = "fluentbit"
-          }
-          memoryReservation                      = 50
-          cloudwatch_log_group_retention_in_days = 30
-        }
+      container_definitions = {        
         scheduler = {
           cpu       = 1024
           memory    = 2048
@@ -701,10 +764,7 @@ module "ha_airflow_ecs_cluster" {
               type  = "spread",
               field = "attribute:ecs.availability-zone"
             }
-          ]
-          healthCheck = {
-            command = ["CMD-SHELL", "curl -f http://localhost:80 || exit 1"]
-          }
+          ]          
           ulimits = [
             {
               name      = "nofile"
@@ -719,26 +779,22 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.id}" },
+            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" }
           ]
           portMappings = [
             {
               name          = "scheduler"
-              containerPort = 80
-              hostPort      = 80
+              containerPort = 8080
+              hostPort      = 8080
               protocol      = "tcp"
             }
           ]
-          readOnlyRootFilesystem = false
-          dependsOn = [{
-            containerName = "fluent-bit"
-            condition     = "START"
-          }]
+          readOnlyRootFilesystem = false        
           logConfiguration = {
             logDriver = "awslogs"
             options = {
-              awslogs-group         = module.scheduler_log_group.log_group_name
+              awslogs-group         = module.scheduler_log_group.name
               awslogs-region        = var.region
               awslogs-stream-prefix = "scheduler"
             }
@@ -760,8 +816,8 @@ module "ha_airflow_ecs_cluster" {
     worker = {
       cpu                    = 2048
       memory                 = 4096
-      task_exec_iam_role_arn = module.ecs_task_execution_role.arn
-      iam_role_arn           = module.ecs_task_execution_role.arn
+      task_exec_iam_role_arn = module.airflow_worker_task_execution_role.arn
+      iam_role_arn           = module.airflow_worker_task_execution_role.arn
       desired_count          = 2
       launch_type            = "FARGATE"
       assign_public_ip       = false
@@ -775,19 +831,7 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {
-        fluent-bit = {
-          cpu       = 512
-          memory    = 1024
-          essential = true
-          image     = nonsensitive(data.aws_ssm_parameter.fluentbit.value)
-          user      = "0"
-          firelensConfiguration = {
-            type = "fluentbit"
-          }
-          memoryReservation                      = 50
-          cloudwatch_log_group_retention_in_days = 30
-        }
+      container_definitions = {        
         worker = {
           cpu       = 1024
           memory    = 2048
@@ -800,9 +844,6 @@ module "ha_airflow_ecs_cluster" {
               field = "attribute:ecs.availability-zone"
             }
           ]
-          healthCheck = {
-            command = ["CMD-SHELL", "curl -f http://localhost:80 || exit 1"]
-          }
           ulimits = [
             {
               name      = "nofile"
@@ -817,26 +858,22 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.id}" },
+            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" }
           ]
           portMappings = [
             {
               name          = "worker"
-              containerPort = 80
-              hostPort      = 80
+              containerPort = 8080
+              hostPort      = 8080
               protocol      = "tcp"
             }
           ]
-          readOnlyRootFilesystem = false
-          dependsOn = [{
-            containerName = "fluent-bit"
-            condition     = "START"
-          }]
+          readOnlyRootFilesystem = false          
           logConfiguration = {
             logDriver = "awslogs"
             options = {
-              awslogs-group         = module.worker_log_group.log_group_name
+              awslogs-group         = module.worker_log_group.name
               awslogs-region        = var.region
               awslogs-stream-prefix = "worker"
             }
@@ -877,7 +914,6 @@ module "worker_auto_scaling" {
       target_value = 70.0
     }
   }
-
 }
 
 # -----------------------------------------------------------------------------------------
@@ -979,9 +1015,9 @@ module "alb_unhealthy_targets" {
   alarm_description   = "Unhealthy targets detected in ALB"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
-    LoadBalancer = module.webserver_lb.lb_arn
+    LoadBalancer = module.webserver_lb.arn
     TargetGroup = element(
-      split("loadbalancer/", module.webserver_lb.lb_arn),
+      split("loadbalancer/", module.webserver_lb.arn),
       1
     )
   }

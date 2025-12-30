@@ -1,3 +1,8 @@
+# -----------------------------------------------------------------------------
+# Use "aws_elasticache_cluster" resource for single node clusters
+# Use "aws_elasticache_replication_group" resource for clusters with replicas
+# -----------------------------------------------------------------------------
+
 # resource "aws_elasticache_cluster" "cluster" {
 #   cluster_id           = var.cluster_id
 #   engine               = var.cluster_engine
@@ -20,7 +25,7 @@ resource "aws_elasticache_replication_group" "replication_group" {
   num_cache_clusters         = var.num_cache_clusters
   automatic_failover_enabled = var.automatic_failover_enabled
   subnet_group_name          = aws_elasticache_subnet_group.subnet_group_name.name
-  security_group_ids         = [aws_security_group.redis_sg.id]
+  security_group_ids         = var.vpc_security_group_ids
   parameter_group_name       = var.parameter_group_name
   dynamic "log_delivery_configuration" {
     for_each = var.log_delivery_configuration

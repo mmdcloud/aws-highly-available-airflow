@@ -12,6 +12,16 @@ variable "private_subnets" {
   description = "Private Subnet CIDR values"
 }
 
+variable "database_subnets" {
+  type        = list(string)
+  description = "Database Subnet CIDR values"
+}
+
+variable "elasticache_subnets" {
+  type        = list(string)
+  description = "Redis Subnet CIDR values"
+}
+
 variable "azs" {
   type        = list(string)
   description = "Availability Zones"

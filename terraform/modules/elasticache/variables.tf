@@ -6,7 +6,10 @@ variable "engine_version" {}
 variable "port" {}
 variable "subnet_group_name" {}
 variable "subnet_group_ids" {}
-variable "vpc_security_group_ids" {}
+variable "vpc_security_group_ids" {
+  type = list(string)
+  default = []
+}
 variable "maintenance_window" {}
 variable "automatic_failover_enabled" {}
 variable "replication_group_id" {}
