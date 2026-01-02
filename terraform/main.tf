@@ -30,8 +30,8 @@ module "vpc" {
   create_igw              = true
   map_public_ip_on_launch = true
   enable_nat_gateway      = true
-  single_nat_gateway      = true
-  one_nat_gateway_per_az  = false
+  single_nat_gateway      = false
+  one_nat_gateway_per_az  = true
   tags = {
     Project = "ha-airflow"
   }
@@ -204,6 +204,39 @@ module "airflow_redis_sg" {
   }
 }
 
+module "efs_sg" {
+  source = "./modules/security-groups"
+  name   = "airflow-efs-sg"
+  vpc_id = module.vpc.vpc_id
+  ingress_rules = [
+    {
+      description = "NFS from Airflow components"
+      from_port   = 2049
+      to_port     = 2049
+      protocol    = "tcp"
+      security_groups = [
+        module.airflow_webserver_sg.id,
+        module.airflow_scheduler_sg.id,
+        module.airflow_worker_sg.id
+      ]
+      cidr_blocks = []
+    }
+  ]
+  egress_rules = [
+    {
+      description     = "Allow all outbound traffic"
+      from_port       = 0
+      to_port         = 0
+      protocol        = "-1"
+      security_groups = []
+      cidr_blocks     = ["0.0.0.0/0"]
+    }
+  ]
+  tags = {
+    Name = "airflow-efs-sg"
+  }
+}
+
 # -----------------------------------------------------------------------------------------
 # Secrets manager configuration
 # -----------------------------------------------------------------------------------------
@@ -303,6 +336,145 @@ module "airflow_webserver_lb_logs" {
 }
 
 # -----------------------------------------------------------------------------------------
+# EFS File System for DAGs
+# -----------------------------------------------------------------------------------------
+module "airflow_dags_efs" {
+  source = "./modules/efs"
+  
+  name           = "airflow-dags-efs"
+  creation_token = "airflow-dags-${random_id.id.hex}"
+
+  # Network Configuration
+  subnet_ids         = module.vpc.private_subnets
+  security_group_ids = [module.efs_sg.id]
+
+  # Encryption (Production Best Practice)
+  encrypted      = true
+  create_kms_key = true
+
+  # Performance Configuration
+  # generalPurpose is suitable for most Airflow workloads
+  # Use maxIO only if you have hundreds of concurrent connections
+  performance_mode = "generalPurpose"
+  
+  # Elastic throughput automatically scales with workload
+  # Recommended for variable workloads like Airflow
+  throughput_mode = "elastic"
+
+  # Lifecycle Management for Cost Optimization
+  # Move infrequently accessed files to IA storage after 30 days
+  lifecycle_policies = [
+    {
+      transition_to_ia = "AFTER_30_DAYS"
+    }
+  ]
+
+  # Access Points for Different Airflow Components
+  access_points = {
+    dags = {
+      root_directory_path = "/dags"
+      creation_info = {
+        owner_gid   = 50000  # airflow group
+        owner_uid   = 50000  # airflow user
+        permissions = "755"
+      }
+      posix_user = {
+        gid = 50000
+        uid = 50000
+      }
+      tags = {
+        Component = "dags"
+      }
+    }
+    plugins = {
+      root_directory_path = "/plugins"
+      creation_info = {
+        owner_gid   = 50000
+        owner_uid   = 50000
+        permissions = "755"
+      }
+      posix_user = {
+        gid = 50000
+        uid = 50000
+      }
+      tags = {
+        Component = "plugins"
+      }
+    }
+  }
+
+  # File System Policy - Enforce TLS and IAM
+  file_system_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EnforceTLS"
+        Effect = "Deny"
+        Principal = {
+          AWS = "*"
+        }
+        Action   = "*"
+        Resource = "*"
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+      {
+        Sid    = "AllowRootAccessForTasks"
+        Effect = "Allow"
+        Principal = {
+          AWS = [
+            module.airflow_webserver_task_execution_role.arn,
+            module.airflow_scheduler_task_execution_role.arn,
+            module.airflow_worker_task_execution_role.arn
+          ]
+        }
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  # Backup Configuration
+  enable_backup_policy      = true
+  create_custom_backup_plan = true
+  backup_vault_name         = "Default"
+  backup_schedule           = "cron(0 2 * * ? *)" # Daily at 2 AM UTC
+  backup_retention_days     = 35
+  backup_cold_storage_after = 30
+  backup_iam_role_arn       = aws_iam_role.backup_role.arn
+
+  # Weekly backups with longer retention
+  enable_weekly_backup              = true
+  weekly_backup_schedule            = "cron(0 3 ? * SUN *)"
+  weekly_backup_retention_days      = 90
+  weekly_backup_cold_storage_after  = 60
+
+  # CloudWatch Alarms
+  enable_cloudwatch_alarms       = true
+  alarm_actions                  = [module.alarm_notifications.arn]
+  burst_credit_balance_threshold = 1000000000000 # 1 TB
+  percent_io_limit_threshold     = 80
+
+  # Disaster Recovery (Optional - for production)
+  # Uncomment if you need cross-region replication
+  # enable_replication              = true
+  # replication_destination_region  = "us-west-2"
+
+  tags = {
+    Project     = "ha-airflow"
+    Component   = "dags"
+    Environment = "production"
+  }
+}
+
+# -----------------------------------------------------------------------------------------
 # RDS Configuration ( Database for storing Metadata of Airflow )
 # -----------------------------------------------------------------------------------------
 resource "aws_iam_role" "rds_monitoring_role" {
@@ -327,7 +499,7 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
 
 module "airflow_metadata_db" {
   source                          = "./modules/rds"
-  db_name                         = "airflow-metadata-db"
+  db_name                         = "airflow"
   allocated_storage               = 100
   max_allocated_storage           = 200
   storage_type                    = "gp3"
@@ -462,7 +634,7 @@ module "webserver_lb" {
         enabled             = true
         healthy_threshold   = 3
         interval            = 30
-        path                = "/"
+        path                = "/health"
         port                = 8080
         protocol            = "HTTP"
         unhealthy_threshold = 3
@@ -481,7 +653,7 @@ module "webserver_lb" {
 # -----------------------------------------------------------------------------------------
 module "airflow_webserver_task_execution_role" {
   source             = "./modules/iam"
-  role_name          = "ecs-task-execution-role"
+  role_name          = "airflow-webserver-task-execution-role"
   role_description   = "IAM role for ECS task execution"
   policy_name        = "ecs-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
@@ -507,9 +679,15 @@ module "airflow_webserver_task_execution_role" {
             {
                 "Action": [
                   "s3:PutObject",
-                  "s3:GetObject"
+                  "s3:GetObject",
+                  "s3:ListBucket"
                 ],
-                "Resource": "${module.airflow_dags_bucket.arn}/*",
+                "Resource": [
+                  "${module.airflow_dags_bucket.arn}/*",
+                  "${module.airflow_logs_bucket.arn}/*",
+                  "${module.airflow_dags_bucket.arn}",
+                  "${module.airflow_logs_bucket.arn}"
+                ],
                 "Effect": "Allow"
             },
             {
@@ -527,7 +705,7 @@ module "airflow_webserver_task_execution_role" {
 
 module "airflow_scheduler_task_execution_role" {
   source             = "./modules/iam"
-  role_name          = "ecs-task-execution-role"
+  role_name          = "airflow-scheduler-task-execution-role"
   role_description   = "IAM role for ECS task execution"
   policy_name        = "ecs-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
@@ -553,9 +731,15 @@ module "airflow_scheduler_task_execution_role" {
             {
                 "Action": [
                   "s3:PutObject",
-                  "s3:GetObject"
+                  "s3:GetObject",
+                  "s3:ListBucket"
                 ],
-                "Resource": "${module.airflow_dags_bucket.arn}/*",
+                "Resource": [
+                  "${module.airflow_dags_bucket.arn}/*",
+                  "${module.airflow_logs_bucket.arn}/*",
+                  "${module.airflow_dags_bucket.arn}",
+                  "${module.airflow_logs_bucket.arn}"
+                ],
                 "Effect": "Allow"
             },
             {
@@ -573,7 +757,7 @@ module "airflow_scheduler_task_execution_role" {
 
 module "airflow_worker_task_execution_role" {
   source             = "./modules/iam"
-  role_name          = "ecs-task-execution-role"
+  role_name          = "airflow-worker-task-execution-role"
   role_description   = "IAM role for ECS task execution"
   policy_name        = "ecs-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
@@ -599,9 +783,15 @@ module "airflow_worker_task_execution_role" {
             {
                 "Action": [
                   "s3:PutObject",
-                  "s3:GetObject"
+                  "s3:GetObject",
+                  "s3:ListBucket"
                 ],
-                "Resource": "${module.airflow_dags_bucket.arn}/*",
+                "Resource": [
+                  "${module.airflow_dags_bucket.arn}/*",
+                  "${module.airflow_logs_bucket.arn}/*",
+                  "${module.airflow_dags_bucket.arn}",
+                  "${module.airflow_logs_bucket.arn}"
+                ],
                 "Effect": "Allow"
             },
             {
@@ -618,8 +808,18 @@ module "airflow_worker_task_execution_role" {
 }
 
 # ECR-ECS policy attachment 
-resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy_attachment" {
-  role       = module.ecs_task_execution_role.name
+resource "aws_iam_role_policy_attachment" "airflow_webserver_task_execution_role_policy_attachment" {
+  role       = module.airflow_webserver_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "airflow_scheduler_task_execution_role_policy_attachment" {
+  role       = module.airflow_scheduler_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "airflow_worker_task_execution_role_policy_attachment" {
+  role       = module.airflow_worker_task_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
@@ -640,6 +840,79 @@ module "worker_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
   log_group_name    = "/aws/ecs/airflow/worker"
   retention_in_days = 7
+}
+
+# Add after your ECS cluster module
+resource "aws_ecs_task_definition" "airflow_db_init" {
+  family                   = "airflow-db-init"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = module.airflow_scheduler_task_execution_role.arn
+  task_role_arn            = module.airflow_scheduler_task_execution_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "db-init"
+      image     = "apache/airflow:2.10.4"
+      essential = true
+      command   = ["db", "init"]
+
+      environment = [
+        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = module.scheduler_log_group.name
+          awslogs-region        = var.region
+          awslogs-stream-prefix = "db-init"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_task_definition" "airflow_create_user" {
+  family                   = "airflow-create-user"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = module.airflow_scheduler_task_execution_role.arn
+  task_role_arn            = module.airflow_scheduler_task_execution_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "create-user"
+      image     = "apache/airflow:2.10.4"
+      essential = true
+      command = [
+        "users", "create",
+        "--username", "admin",
+        "--firstname", "Admin",
+        "--lastname", "User",
+        "--role", "Admin",
+        "--email", "admin@example.com",
+        "--password", "admin123" # Change this!
+      ]
+
+      environment = [
+        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = module.scheduler_log_group.name
+          awslogs-region        = var.region
+          awslogs-stream-prefix = "create-user"
+        }
+      }
+    }
+  ])
 }
 
 module "ha_airflow_ecs_cluster" {
@@ -664,19 +937,41 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {        
+
+      volume = [
+        {
+          name = "dags"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
+              iam             = "ENABLED"
+            }
+          }
+        },
+        {
+          name = "plugins"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+      ]
+
+      container_definitions = {
         webserver = {
           cpu       = 1024
           memory    = 2048
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["webserver"]
-          placementStrategy = [
-            {
-              type  = "spread",
-              field = "attribute:ecs.availability-zone"
-            }
-          ]
           ulimits = [
             {
               name      = "nofile"
@@ -695,6 +990,7 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
+            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -703,7 +999,7 @@ module "ha_airflow_ecs_cluster" {
             # { name = "AIRFLOW__WEBSERVER__BASE_URL", value = "https://${var.domain_name}" },
             { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" }
           ]
-          readonlyRootFilesystem = false          
+          readonlyRootFilesystem    = false
           enable_cloudwatch_logging = true
           logConfiguration = {
             logDriver = "awslogs"
@@ -752,19 +1048,41 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {        
+
+      volume = [
+        {
+          name = "dags"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
+              iam             = "ENABLED"
+            }
+          }
+        },
+        {
+          name = "plugins"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+      ]
+
+      container_definitions = {
         scheduler = {
           cpu       = 1024
           memory    = 2048
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["scheduler"]
-          placementStrategy = [
-            {
-              type  = "spread",
-              field = "attribute:ecs.availability-zone"
-            }
-          ]          
           ulimits = [
             {
               name      = "nofile"
@@ -775,6 +1093,7 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
+            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -782,15 +1101,7 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" }
           ]
-          portMappings = [
-            {
-              name          = "scheduler"
-              containerPort = 8080
-              hostPort      = 8080
-              protocol      = "tcp"
-            }
-          ]
-          readOnlyRootFilesystem = false        
+          readOnlyRootFilesystem = false
           logConfiguration = {
             logDriver = "awslogs"
             options = {
@@ -831,19 +1142,41 @@ module "ha_airflow_ecs_cluster" {
       }
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
-      container_definitions = {        
+
+      volume = [
+        {
+          name = "dags"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
+              iam             = "ENABLED"
+            }
+          }
+        },
+        {
+          name = "plugins"
+          efs_volume_configuration = {
+            file_system_id          = module.airflow_dags_efs.id
+            transit_encryption      = "ENABLED"
+            transit_encryption_port = 2049
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+      ]
+
+      container_definitions = {
         worker = {
           cpu       = 1024
           memory    = 2048
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["celery", "worker"]
-          placementStrategy = [
-            {
-              type  = "spread",
-              field = "attribute:ecs.availability-zone"
-            }
-          ]
           ulimits = [
             {
               name      = "nofile"
@@ -854,6 +1187,7 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
+            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
@@ -861,15 +1195,7 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" }
           ]
-          portMappings = [
-            {
-              name          = "worker"
-              containerPort = 8080
-              hostPort      = 8080
-              protocol      = "tcp"
-            }
-          ]
-          readOnlyRootFilesystem = false          
+          readOnlyRootFilesystem = false
           logConfiguration = {
             logDriver = "awslogs"
             options = {
@@ -894,6 +1220,54 @@ module "ha_airflow_ecs_cluster" {
   }
 }
 
+resource "null_resource" "airflow_db_init" {
+  depends_on = [
+    module.airflow_metadata_db,
+    module.ha_airflow_ecs_cluster,
+    aws_ecs_task_definition.airflow_db_init
+  ]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws ecs run-task \
+        --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+        --task-definition ${aws_ecs_task_definition.airflow_db_init.family} \
+        --launch-type FARGATE \
+        --region ${var.region} \
+        --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
+        --query 'tasks[0].taskArn' \
+        --output text
+      
+      echo "Waiting for DB initialization to complete..."
+      sleep 180
+    EOT
+  }
+
+  triggers = {
+    db_endpoint = module.airflow_metadata_db.endpoint
+  }
+}
+
+resource "null_resource" "airflow_create_user" {
+  depends_on = [
+    null_resource.airflow_db_init,
+    aws_ecs_task_definition.airflow_create_user
+  ]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws ecs run-task \
+        --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+        --task-definition ${aws_ecs_task_definition.airflow_create_user.family} \
+        --launch-type FARGATE \
+        --region ${var.region} \
+        --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
+        --query 'tasks[0].taskArn' \
+        --output text
+    EOT
+  }
+}
+
 # -----------------------------------------------------------------------------------------
 # Auto Scaling Configuration
 # -----------------------------------------------------------------------------------------
@@ -902,8 +1276,8 @@ module "worker_auto_scaling" {
   service_namespace  = "ecs"
   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["worker"].name}"
   scalable_dimension = "ecs:service:DesiredCount"
-  min_capacity       = 3
-  max_capacity       = 20
+  min_capacity       = 2
+  max_capacity       = 5
   policies = {
     name        = "worker-scale-up"
     policy_type = "TargetTrackingScaling"
@@ -1015,10 +1389,13 @@ module "alb_unhealthy_targets" {
   alarm_description   = "Unhealthy targets detected in ALB"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
-    LoadBalancer = module.webserver_lb.arn
+    LoadBalancer = element(
+      split(":", module.webserver_lb.arn_suffix),
+      0
+    )
     TargetGroup = element(
-      split("loadbalancer/", module.webserver_lb.arn),
-      1
+      split(":", module.webserver_lb.target_groups["webserver_lb_target_group"].arn_suffix),
+      0
     )
   }
 }
