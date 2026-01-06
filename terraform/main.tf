@@ -1,9 +1,11 @@
 # -----------------------------------------------------------------------------------------
-# Registering vault provider
+# Data Sources
 # -----------------------------------------------------------------------------------------
 data "vault_generic_secret" "rds" {
   path = "secret/rds"
 }
+
+data "aws_elb_service_account" "main" {}
 
 data "vault_generic_secret" "redis" {
   path = "secret/redis"
@@ -158,15 +160,7 @@ module "airflow_rds_sg" {
       cidr_blocks = []
     }
   ]
-  egress_rules = [
-    {
-      description = "Allow all outbound traffic"
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  ]
+  egress_rules = []
   tags = {
     Name = "airflow-rds-sg"
   }
@@ -190,15 +184,7 @@ module "airflow_redis_sg" {
       cidr_blocks = []
     }
   ]
-  egress_rules = [
-    {
-      description = "Allow all outbound traffic"
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  ]
+  egress_rules = []
   tags = {
     Name = "airflow-redis-sg"
   }
@@ -244,7 +230,7 @@ module "metadata_db_credentials" {
   source                  = "./modules/secrets-manager"
   name                    = "metadata-db-rds-secrets"
   description             = "Secret for storing Metadata DB credentials"
-  recovery_window_in_days = 0
+  recovery_window_in_days = 7
   secret_string = jsonencode({
     username = tostring(data.vault_generic_secret.rds.data["username"])
     password = tostring(data.vault_generic_secret.rds.data["password"])
@@ -254,33 +240,6 @@ module "metadata_db_credentials" {
 # -----------------------------------------------------------------------------------------
 # S3 Configuration
 # -----------------------------------------------------------------------------------------
-module "airflow_dags_bucket" {
-  source             = "./modules/s3"
-  bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
-  objects            = []
-  versioning_enabled = "Enabled"
-  cors = [
-    {
-      allowed_headers = ["*"]
-      allowed_methods = ["PUT"]
-      allowed_origins = ["*"]
-      max_age_seconds = 3000
-    },
-    {
-      allowed_headers = ["*"]
-      allowed_methods = ["GET"]
-      allowed_origins = ["*"]
-      max_age_seconds = 3000
-    }
-  ]
-  bucket_policy = ""
-  force_destroy = true
-  bucket_notification = {
-    queue           = []
-    lambda_function = []
-  }
-}
-
 module "airflow_logs_bucket" {
   source             = "./modules/s3"
   bucket_name        = "airflow-logs-bucket-${random_id.id.hex}"
@@ -327,7 +286,38 @@ module "airflow_webserver_lb_logs" {
       max_age_seconds = 3000
     }
   ]
-  bucket_policy = ""
+  bucket_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSLogDeliveryWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "logging.s3.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::airflow-webserver-lb-logs-${random_id.id.hex}/*"
+      },
+      {
+        Sid    = "AWSLogDeliveryAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "logging.s3.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = "arn:aws:s3:::airflow-webserver-lb-logs-${random_id.id.hex}"
+      },
+      {
+        Sid    = "AWSELBAccountWrite"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_elb_service_account.main.id}:root"
+        }
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::airflow-webserver-lb-logs-${random_id.id.hex}/*"
+      }
+    ]
+  })
   force_destroy = true
   bucket_notification = {
     queue           = []
@@ -340,7 +330,7 @@ module "airflow_webserver_lb_logs" {
 # -----------------------------------------------------------------------------------------
 module "airflow_dags_efs" {
   source = "./modules/efs"
-  
+
   name           = "airflow-dags-efs"
   creation_token = "airflow-dags-${random_id.id.hex}"
 
@@ -356,7 +346,7 @@ module "airflow_dags_efs" {
   # generalPurpose is suitable for most Airflow workloads
   # Use maxIO only if you have hundreds of concurrent connections
   performance_mode = "generalPurpose"
-  
+
   # Elastic throughput automatically scales with workload
   # Recommended for variable workloads like Airflow
   throughput_mode = "elastic"
@@ -374,8 +364,8 @@ module "airflow_dags_efs" {
     dags = {
       root_directory_path = "/dags"
       creation_info = {
-        owner_gid   = 50000  # airflow group
-        owner_uid   = 50000  # airflow user
+        owner_gid   = 50000 # airflow group
+        owner_uid   = 50000 # airflow user
         permissions = "755"
       }
       posix_user = {
@@ -448,13 +438,12 @@ module "airflow_dags_efs" {
   backup_schedule           = "cron(0 2 * * ? *)" # Daily at 2 AM UTC
   backup_retention_days     = 35
   backup_cold_storage_after = 30
-  backup_iam_role_arn       = aws_iam_role.backup_role.arn
 
   # Weekly backups with longer retention
-  enable_weekly_backup              = true
-  weekly_backup_schedule            = "cron(0 3 ? * SUN *)"
-  weekly_backup_retention_days      = 90
-  weekly_backup_cold_storage_after  = 60
+  enable_weekly_backup             = true
+  weekly_backup_schedule           = "cron(0 3 ? * SUN *)"
+  weekly_backup_retention_days     = 90
+  weekly_backup_cold_storage_after = 60
 
   # CloudWatch Alarms
   enable_cloudwatch_alarms       = true
@@ -564,7 +553,7 @@ module "airflow_redis_cache" {
   engine                     = "redis"
   engine_version             = "7.0"
   node_type                  = "cache.t4g.micro"
-  num_cache_clusters         = 3
+  num_cache_clusters         = 2
   parameter_group_name       = "default.redis7"
   subnet_group_name          = "airflow-redis-cache-subnet-group"
   multi_az_enabled           = true
@@ -683,9 +672,7 @@ module "airflow_webserver_task_execution_role" {
                   "s3:ListBucket"
                 ],
                 "Resource": [
-                  "${module.airflow_dags_bucket.arn}/*",
                   "${module.airflow_logs_bucket.arn}/*",
-                  "${module.airflow_dags_bucket.arn}",
                   "${module.airflow_logs_bucket.arn}"
                 ],
                 "Effect": "Allow"
@@ -697,6 +684,15 @@ module "airflow_webserver_task_execution_role" {
                 "secretsmanager:DescribeSecret"
               ],
               "Resource": "${module.metadata_db_credentials.arn}"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "elasticfilesystem:ClientMount",
+                "elasticfilesystem:ClientWrite",
+                "elasticfilesystem:DescribeMountTargets"
+              ],
+              "Resource": "${module.airflow_dags_efs.arn}"
             }
         ]
     }
@@ -735,9 +731,7 @@ module "airflow_scheduler_task_execution_role" {
                   "s3:ListBucket"
                 ],
                 "Resource": [
-                  "${module.airflow_dags_bucket.arn}/*",
                   "${module.airflow_logs_bucket.arn}/*",
-                  "${module.airflow_dags_bucket.arn}",
                   "${module.airflow_logs_bucket.arn}"
                 ],
                 "Effect": "Allow"
@@ -749,6 +743,15 @@ module "airflow_scheduler_task_execution_role" {
                 "secretsmanager:DescribeSecret"
               ],
               "Resource": "${module.metadata_db_credentials.arn}"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "elasticfilesystem:ClientMount",
+                "elasticfilesystem:ClientWrite",
+                "elasticfilesystem:DescribeMountTargets"
+              ],
+              "Resource": "${module.airflow_dags_efs.arn}"
             }
         ]
     }
@@ -787,9 +790,7 @@ module "airflow_worker_task_execution_role" {
                   "s3:ListBucket"
                 ],
                 "Resource": [
-                  "${module.airflow_dags_bucket.arn}/*",
                   "${module.airflow_logs_bucket.arn}/*",
-                  "${module.airflow_dags_bucket.arn}",
                   "${module.airflow_logs_bucket.arn}"
                 ],
                 "Effect": "Allow"
@@ -801,6 +802,15 @@ module "airflow_worker_task_execution_role" {
                 "secretsmanager:DescribeSecret"
               ],
               "Resource": "${module.metadata_db_credentials.arn}"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "elasticfilesystem:ClientMount",
+                "elasticfilesystem:ClientWrite",
+                "elasticfilesystem:DescribeMountTargets"
+              ],
+              "Resource": "${module.airflow_dags_efs.arn}"
             }
         ]
     }
@@ -987,9 +997,20 @@ module "ha_airflow_ecs_cluster" {
               protocol      = "tcp"
             }
           ]
+          mountPoints = [
+            {
+              sourceVolume  = "dags"
+              containerPath = "/opt/airflow/dags"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "plugins"
+              containerPath = "/opt/airflow/plugins"
+              readOnly      = false
+            }
+          ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
@@ -1090,9 +1111,20 @@ module "ha_airflow_ecs_cluster" {
               hardLimit = 65536
             }
           ]
+          mountPoints = [
+            {
+              sourceVolume  = "dags"
+              containerPath = "/opt/airflow/dags"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "plugins"
+              containerPath = "/opt/airflow/plugins"
+              readOnly      = false
+            }
+          ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
@@ -1184,9 +1216,20 @@ module "ha_airflow_ecs_cluster" {
               hardLimit = 65536
             }
           ]
+          mountPoints = [
+            {
+              sourceVolume  = "dags"
+              containerPath = "/opt/airflow/dags"
+              readOnly      = false
+            },
+            {
+              sourceVolume  = "plugins"
+              containerPath = "/opt/airflow/plugins"
+              readOnly      = false
+            }
+          ]
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__S3__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
             { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
@@ -1278,16 +1321,18 @@ module "worker_auto_scaling" {
   scalable_dimension = "ecs:service:DesiredCount"
   min_capacity       = 2
   max_capacity       = 5
-  policies = {
-    name        = "worker-scale-up"
-    policy_type = "TargetTrackingScaling"
-    target_tracking_scaling_policy_configuration = {
-      predefined_metric_specification = {
-        predefined_metric_type = "ECSServiceAverageCPUUtilization"
+  policies = [
+    {
+      name        = "worker-scale-up"
+      policy_type = "TargetTrackingScaling"
+      target_tracking_scaling_policy_configuration = {
+        predefined_metric_specification = {
+          predefined_metric_type = "ECSServiceAverageCPUUtilization"
+        }
+        target_value = 70.0
       }
-      target_value = 70.0
     }
-  }
+  ]
 }
 
 # -----------------------------------------------------------------------------------------
@@ -1389,13 +1434,7 @@ module "alb_unhealthy_targets" {
   alarm_description   = "Unhealthy targets detected in ALB"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
-    LoadBalancer = element(
-      split(":", module.webserver_lb.arn_suffix),
-      0
-    )
-    TargetGroup = element(
-      split(":", module.webserver_lb.target_groups["webserver_lb_target_group"].arn_suffix),
-      0
-    )
+    TargetGroup  = module.webserver_lb.target_groups["webserver_lb_target_group"].arn_suffix
+    LoadBalancer = module.webserver_lb.arn_suffix
   }
 }
