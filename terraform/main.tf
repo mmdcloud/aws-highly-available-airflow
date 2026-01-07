@@ -1,3 +1,17 @@
+locals {
+  rds_username     = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
+  rds_password     = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
+  redis_auth_token = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
+
+  # Use primary_endpoint_address instead of configuration_endpoint_address
+  redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
+  
+  # Build connection strings in locals
+  database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+  celery_broker_url     = "redis://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
+  celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+}
+
 # -----------------------------------------------------------------------------------------
 # Data Sources
 # -----------------------------------------------------------------------------------------
@@ -326,8 +340,87 @@ module "airflow_webserver_lb_logs" {
 }
 
 # -----------------------------------------------------------------------------------------
+# SNS Configuration
+# -----------------------------------------------------------------------------------------
+module "alarm_notifications" {
+  source     = "./modules/sns"
+  topic_name = "ha-airflow-cloudwatch-alarm-notification-topic"
+  subscriptions = [
+    {
+      protocol = "email"
+      endpoint = "madmaxcloudonline@gmail.com"
+    }
+  ]
+}
+
+# -----------------------------------------------------------------------------------------
 # EFS File System for DAGs
 # -----------------------------------------------------------------------------------------
+module "efs_backup_role" {
+  source             = "./modules/iam"
+  role_name          = "efs_backup_role"
+  role_description   = "IAM role for EFS Backup"
+  policy_name        = "efs_backup_role-policy"
+  policy_description = "IAM policy for EFS Backup"
+  assume_role_policy = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "sts:AssumeRole",
+                "Principal": {
+                  "Service": "backup.amazonaws.com"
+                },
+                "Effect": "Allow",
+                "Sid": ""
+            }
+        ]
+    }
+    EOF
+  policy             = <<EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": [
+                  "elasticfilesystem:Backup",
+                  "elasticfilesystem:DescribeTags"
+                ],
+                "Resource": "*",
+                "Effect": "Allow"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "kms:Decrypt",
+                "kms:DescribeKey",
+                "kms:GenerateDataKey"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "tag:GetResources"
+              ],
+              "Resource": "*"
+            }
+        ]
+    }
+    EOF
+}
+
+resource "aws_iam_role_policy_attachment" "efs_backup_policy" {
+  role       = module.efs_backup_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+}
+
+# Attach AWS managed policy for restore operations
+resource "aws_iam_role_policy_attachment" "efs_restore_policy" {
+  role       = module.efs_backup_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
+}
+
 module "airflow_dags_efs" {
   source = "./modules/efs"
 
@@ -335,9 +428,9 @@ module "airflow_dags_efs" {
   creation_token = "airflow-dags-${random_id.id.hex}"
 
   # Network Configuration
-  subnet_ids         = module.vpc.private_subnets
-  security_group_ids = [module.efs_sg.id]
-
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.efs_sg.id]
+  backup_iam_role_arn = module.efs_backup_role.arn
   # Encryption (Production Best Practice)
   encrypted      = true
   create_kms_key = true
@@ -354,9 +447,9 @@ module "airflow_dags_efs" {
   # Lifecycle Management for Cost Optimization
   # Move infrequently accessed files to IA storage after 30 days
   lifecycle_policies = [
-    {
-      transition_to_ia = "AFTER_30_DAYS"
-    }
+    # {
+    #   transition_to_ia = "AFTER_30_DAYS"
+    # }
   ]
 
   # Access Points for Different Airflow Components
@@ -393,43 +486,43 @@ module "airflow_dags_efs" {
     }
   }
 
-  # File System Policy - Enforce TLS and IAM
-  file_system_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "EnforceTLS"
-        Effect = "Deny"
-        Principal = {
-          AWS = "*"
-        }
-        Action   = "*"
-        Resource = "*"
-        Condition = {
-          Bool = {
-            "aws:SecureTransport" = "false"
-          }
-        }
-      },
-      {
-        Sid    = "AllowRootAccessForTasks"
-        Effect = "Allow"
-        Principal = {
-          AWS = [
-            module.airflow_webserver_task_execution_role.arn,
-            module.airflow_scheduler_task_execution_role.arn,
-            module.airflow_worker_task_execution_role.arn
-          ]
-        }
-        Action = [
-          "elasticfilesystem:ClientMount",
-          "elasticfilesystem:ClientWrite",
-          "elasticfilesystem:ClientRootAccess"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
+  # File System Policy - Enforce TLS and IAM 
+  # file_system_policy = jsonencode({
+  #   Version = "2012-10-17"
+  #   Statement = [
+  #     {
+  #       Sid    = "EnforceTLS"
+  #       Effect = "Deny"
+  #       Principal = {
+  #         AWS = "*"
+  #       }
+  #       Action   = "*"
+  #       Resource = "*"
+  #       Condition = {
+  #         Bool = {
+  #           "aws:SecureTransport" = "false"
+  #         }
+  #       }
+  #     },
+  #     {
+  #       Sid    = "AllowRootAccessForTasks"
+  #       Effect = "Allow"
+  #       Principal = {
+  #         AWS = [
+  #           module.airflow_webserver_task_execution_role.arn,
+  #           module.airflow_scheduler_task_execution_role.arn,
+  #           module.airflow_worker_task_execution_role.arn
+  #         ]
+  #       }
+  #       Action = [
+  #         "elasticfilesystem:ClientMount",
+  #         "elasticfilesystem:ClientWrite",
+  #         "elasticfilesystem:ClientRootAccess"
+  #       ]
+  #       Resource = "*"
+  #     }
+  #   ]
+  # })
 
   # Backup Configuration
   enable_backup_policy      = true
@@ -524,18 +617,18 @@ module "airflow_metadata_db" {
       name  = "max_connections"
       value = "500"
     },
-    {
-      name  = "shared_buffers"
-      value = "{DBInstanceClassMemory/10240}"
-    },
-    {
-      name  = "effective_cache_size"
-      value = "{DBInstanceClassMemory/5120}"
-    },
-    {
-      name  = "log_min_duration_statement"
-      value = "1000"
-    }
+    # {
+    #   name  = "shared_buffers"
+    #   value = "{DBInstanceClassMemory/10240}"
+    # },
+    # {
+    #   name  = "effective_cache_size"
+    #   value = "{DBInstanceClassMemory/5120}"
+    # },
+    # {
+    #   name  = "log_min_duration_statement"
+    #   value = "1000"
+    # }
   ]
 }
 
@@ -644,7 +737,7 @@ module "airflow_webserver_task_execution_role" {
   source             = "./modules/iam"
   role_name          = "airflow-webserver-task-execution-role"
   role_description   = "IAM role for ECS task execution"
-  policy_name        = "ecs-task-execution-policy"
+  policy_name        = "airflow-webserver-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
   assume_role_policy = <<EOF
     {
@@ -703,7 +796,7 @@ module "airflow_scheduler_task_execution_role" {
   source             = "./modules/iam"
   role_name          = "airflow-scheduler-task-execution-role"
   role_description   = "IAM role for ECS task execution"
-  policy_name        = "ecs-task-execution-policy"
+  policy_name        = "airflow-scheduler-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
   assume_role_policy = <<EOF
     {
@@ -762,7 +855,7 @@ module "airflow_worker_task_execution_role" {
   source             = "./modules/iam"
   role_name          = "airflow-worker-task-execution-role"
   role_description   = "IAM role for ECS task execution"
-  policy_name        = "ecs-task-execution-policy"
+  policy_name        = "airflow-worker-task-execution-policy"
   policy_description = "IAM policy for ECS task execution"
   assume_role_policy = <<EOF
     {
@@ -870,7 +963,7 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
       command   = ["db", "init"]
 
       environment = [
-        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" }
+        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
       ]
 
       logConfiguration = {
@@ -910,7 +1003,7 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
       ]
 
       environment = [
-        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" }
+        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
       ]
 
       logConfiguration = {
@@ -948,9 +1041,8 @@ module "ha_airflow_ecs_cluster" {
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
 
-      volume = [
-        {
-          name = "dags"
+      volume = {
+        dags = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -960,9 +1052,8 @@ module "ha_airflow_ecs_cluster" {
               iam             = "ENABLED"
             }
           }
-        },
-        {
-          name = "plugins"
+        }
+        plugins = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -973,7 +1064,7 @@ module "ha_airflow_ecs_cluster" {
             }
           }
         }
-      ]
+      }
 
       container_definitions = {
         webserver = {
@@ -1012,12 +1103,11 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            # { name = "AIRFLOW__WEBSERVER__BASE_URL", value = "https://${var.domain_name}" },
             { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" }
           ]
           readonlyRootFilesystem    = false
@@ -1070,9 +1160,8 @@ module "ha_airflow_ecs_cluster" {
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
 
-      volume = [
-        {
-          name = "dags"
+      volume = {
+        dags = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -1082,9 +1171,8 @@ module "ha_airflow_ecs_cluster" {
               iam             = "ENABLED"
             }
           }
-        },
-        {
-          name = "plugins"
+        }
+        plugins = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -1095,7 +1183,7 @@ module "ha_airflow_ecs_cluster" {
             }
           }
         }
-      ]
+      }
 
       container_definitions = {
         scheduler = {
@@ -1126,9 +1214,9 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" }
@@ -1175,9 +1263,8 @@ module "ha_airflow_ecs_cluster" {
       scheduling_strategy      = "REPLICA"
       requires_compatibilities = ["FARGATE"]
 
-      volume = [
-        {
-          name = "dags"
+      volume = {
+        dags = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -1187,9 +1274,8 @@ module "ha_airflow_ecs_cluster" {
               iam             = "ENABLED"
             }
           }
-        },
-        {
-          name = "plugins"
+        }
+        plugins = {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
@@ -1200,7 +1286,7 @@ module "ha_airflow_ecs_cluster" {
             }
           }
         }
-      ]
+      }
 
       container_definitions = {
         worker = {
@@ -1231,9 +1317,9 @@ module "ha_airflow_ecs_cluster" {
           environment = [
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://:${tostring(data.vault_generic_secret.redis.data["auth_token"])}@${module.airflow_redis_cache.configuration_endpoint_address}:6379/0" },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${tostring(data.vault_generic_secret.rds.data["username"])}:${tostring(data.vault_generic_secret.rds.data["password"])}@${module.airflow_metadata_db.endpoint}/airflow" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" }
@@ -1261,6 +1347,7 @@ module "ha_airflow_ecs_cluster" {
       availability_zone_rebalancing = "ENABLED"
     }
   }
+  depends_on = [ module.airflow_redis_cache ]
 }
 
 resource "null_resource" "airflow_db_init" {
@@ -1331,20 +1418,6 @@ module "worker_auto_scaling" {
         }
         target_value = 70.0
       }
-    }
-  ]
-}
-
-# -----------------------------------------------------------------------------------------
-# SNS Configuration
-# -----------------------------------------------------------------------------------------
-module "alarm_notifications" {
-  source     = "./modules/sns"
-  topic_name = "ha-airflow-cloudwatch-alarm-notification-topic"
-  subscriptions = [
-    {
-      protocol = "email"
-      endpoint = "madmaxcloudonline@gmail.com"
     }
   ]
 }
