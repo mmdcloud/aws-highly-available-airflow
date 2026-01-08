@@ -5,7 +5,7 @@ locals {
 
   # Use primary_endpoint_address instead of configuration_endpoint_address
   redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
-  
+
   # Build connection strings in locals
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
   celery_broker_url     = "redis://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
@@ -242,7 +242,7 @@ module "efs_sg" {
 # -----------------------------------------------------------------------------------------
 module "metadata_db_credentials" {
   source                  = "./modules/secrets-manager"
-  name                    = "metadata-db-rds-secrets"
+  name                    = "metadata-db-rds-secrets-${random_id.id.hex}"
   description             = "Secret for storing Metadata DB credentials"
   recovery_window_in_days = 7
   secret_string = jsonencode({
@@ -1347,7 +1347,7 @@ module "ha_airflow_ecs_cluster" {
       availability_zone_rebalancing = "ENABLED"
     }
   }
-  depends_on = [ module.airflow_redis_cache ]
+  depends_on = [module.airflow_redis_cache]
 }
 
 resource "null_resource" "airflow_db_init" {
