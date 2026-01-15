@@ -529,14 +529,14 @@ module "airflow_dags_efs" {
   create_custom_backup_plan = true
   backup_vault_name         = "Default"
   backup_schedule           = "cron(0 2 * * ? *)" # Daily at 2 AM UTC
-  backup_retention_days     = 35
-  backup_cold_storage_after = 30
+  backup_retention_days     = 120
+  backup_cold_storage_after = null
 
   # Weekly backups with longer retention
   enable_weekly_backup             = true
   weekly_backup_schedule           = "cron(0 3 ? * SUN *)"
   weekly_backup_retention_days     = 90
-  weekly_backup_cold_storage_after = 60
+  weekly_backup_cold_storage_after = null
 
   # CloudWatch Alarms
   enable_cloudwatch_alarms       = true
@@ -586,7 +586,7 @@ module "airflow_metadata_db" {
   max_allocated_storage           = 200
   storage_type                    = "gp3"
   engine                          = "postgres"
-  engine_version                  = "15.4"
+  engine_version                  = "17"
   instance_class                  = "db.r6g.large"
   multi_az                        = true
   storage_encrypted               = true
@@ -595,8 +595,8 @@ module "airflow_metadata_db" {
   subnet_group_name               = "airflow-metadata-db-subnet-group"
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
   backup_retention_period         = 30
-  backup_window                   = "03:00-06:00"
-  maintenance_window              = "mon:04:00-mon:05:00"
+  backup_window                   = "04:00-06:00"
+  maintenance_window              = "Mon:00:00-Mon:03:00"
   subnet_group_ids = [
     module.vpc.database_subnets[0],
     module.vpc.database_subnets[1],
@@ -611,12 +611,12 @@ module "airflow_metadata_db" {
   monitoring_interval                   = 60
   monitoring_role_arn                   = aws_iam_role.rds_monitoring_role.arn
   parameter_group_name                  = "airflow-metadata-db-pg"
-  parameter_group_family                = "postgres15"
+  parameter_group_family                = "postgres17"
   parameters = [
-    {
-      name  = "max_connections"
-      value = "500"
-    },
+    # {
+    #   name  = "max_connections"
+    #   value = "500"
+    # },
     # {
     #   name  = "shared_buffers"
     #   value = "{DBInstanceClassMemory/10240}"
@@ -727,7 +727,11 @@ module "webserver_lb" {
   tags = {
     Project = "ha-airflow"
   }
-  depends_on = [module.vpc]
+  depends_on = [
+    module.vpc,
+    module.airflow_webserver_lb_sg,
+    module.airflow_webserver_lb_logs
+  ]
 }
 
 # -----------------------------------------------------------------------------------------
@@ -1057,7 +1061,7 @@ module "ha_airflow_ecs_cluster" {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            transit_encryption_port = 2999
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
               iam             = "ENABLED"
@@ -1176,7 +1180,7 @@ module "ha_airflow_ecs_cluster" {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            transit_encryption_port = 2999
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
               iam             = "ENABLED"
@@ -1279,7 +1283,7 @@ module "ha_airflow_ecs_cluster" {
           efs_volume_configuration = {
             file_system_id          = module.airflow_dags_efs.id
             transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            transit_encryption_port = 2999
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
               iam             = "ENABLED"
@@ -1347,7 +1351,10 @@ module "ha_airflow_ecs_cluster" {
       availability_zone_rebalancing = "ENABLED"
     }
   }
-  depends_on = [module.airflow_redis_cache]
+  depends_on = [
+    module.airflow_redis_cache,
+    module.webserver_lb
+  ]
 }
 
 resource "null_resource" "airflow_db_init" {
