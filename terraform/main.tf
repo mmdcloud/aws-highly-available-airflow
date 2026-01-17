@@ -681,19 +681,18 @@ module "airflow_redis_cache" {
 # Load Balancer Configuration
 # -----------------------------------------------------------------------------------------
 module "webserver_lb" {
-  source             = "terraform-aws-modules/alb/aws"
-  name               = "airflow-webserver-lb"
-  internal           = false
-  load_balancer_type = "application"
+  source                     = "terraform-aws-modules/alb/aws"
+  name                       = "airflow-webserver-lb"
+  load_balancer_type         = "application"
+  vpc_id                     = module.vpc.vpc_id
+  subnets                    = module.vpc.public_subnets
+  enable_deletion_protection = false
+  drop_invalid_header_fields = true
+  ip_address_type            = "ipv4"
+  internal                   = false
   security_groups = [
     module.airflow_webserver_lb_sg.id
   ]
-  subnets                          = module.vpc.public_subnets
-  enable_deletion_protection       = false
-  enable_http2                     = true
-  enable_cross_zone_load_balancing = true
-  drop_invalid_header_fields       = true
-  ip_address_type                  = "ipv4"
   access_logs = {
     bucket = "${module.airflow_webserver_lb_logs.bucket}"
   }
@@ -1374,7 +1373,7 @@ resource "null_resource" "airflow_db_init" {
         --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
         --query 'tasks[0].taskArn' \
         --output text
-      
+
       echo "Waiting for DB initialization to complete..."
       sleep 180
     EOT
@@ -1408,26 +1407,26 @@ resource "null_resource" "airflow_create_user" {
 # -----------------------------------------------------------------------------------------
 # Auto Scaling Configuration
 # -----------------------------------------------------------------------------------------
-module "worker_auto_scaling" {
-  source             = "./modules/autoscaling"
-  service_namespace  = "ecs"
-  resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["worker"].name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  min_capacity       = 2
-  max_capacity       = 5
-  policies = [
-    {
-      name        = "worker-scale-up"
-      policy_type = "TargetTrackingScaling"
-      target_tracking_scaling_policy_configuration = {
-        predefined_metric_specification = {
-          predefined_metric_type = "ECSServiceAverageCPUUtilization"
-        }
-        target_value = 70.0
-      }
-    }
-  ]
-}
+# module "worker_auto_scaling" {
+#   source             = "./modules/autoscaling"
+#   service_namespace  = "ecs"
+#   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["worker"].name}"
+#   scalable_dimension = "ecs:service:DesiredCount"
+#   min_capacity       = 2
+#   max_capacity       = 5
+#   policies = [
+#     {
+#       name        = "worker-scale-up"
+#       policy_type = "TargetTrackingScaling"
+#       target_tracking_scaling_policy_configuration = {
+#         predefined_metric_specification = {
+#           predefined_metric_type = "ECSServiceAverageCPUUtilization"
+#         }
+#         target_value = 70.0
+#       }
+#     }
+#   ]
+# }
 
 # -----------------------------------------------------------------------------------------
 # Cloudwatch Alarm Configuration
