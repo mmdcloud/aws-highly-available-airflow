@@ -1,3 +1,18 @@
+resource "random_password" "airflow_secret_key" {
+  length  = 32
+  special = true
+}
+
+module "airflow_webserver_secret_key" {
+  source                  = "./modules/secrets-manager"
+  name                    = "airflow-webserver-secret-key-${random_id.id.hex}"
+  description             = "Secret key for Airflow webserver session management"
+  recovery_window_in_days = 7
+  secret_string = jsonencode({
+    secret_key = random_password.airflow_secret_key.result
+  })
+}
+
 locals {
   rds_username     = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
   rds_password     = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
@@ -5,6 +20,9 @@ locals {
 
   # Use primary_endpoint_address instead of configuration_endpoint_address
   redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
+
+  # Get the secret key
+  airflow_secret_key = random_password.airflow_secret_key.result
 
   # Build connection strings in locals
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
@@ -711,6 +729,11 @@ module "webserver_lb" {
       backend_port     = 8080
       target_type      = "ip"
       vpc_id           = module.vpc.vpc_id
+      stickiness = {
+        enabled         = true
+        type            = "lb_cookie"
+        cookie_duration = 86400
+      }
       health_check = {
         enabled             = true
         healthy_threshold   = 3
@@ -720,7 +743,9 @@ module "webserver_lb" {
         protocol            = "HTTP"
         unhealthy_threshold = 3
       }
-      create_attachment = false
+      deregistration_delay   = 30
+      connection_termination = false
+      create_attachment      = false
     }
   }
   tags = {
@@ -1002,7 +1027,7 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
         "--lastname", "User",
         "--role", "Admin",
         "--email", "admin@example.com",
-        "--password", "admin123" # Change this!
+        "--password", "admin123"
       ]
 
       environment = [
@@ -1025,6 +1050,7 @@ module "ha_airflow_ecs_cluster" {
   source       = "terraform-aws-modules/ecs/aws"
   cluster_name = "ha-airflow-ecs-cluster"
   services = {
+
     webserver = {
       cpu                    = 2048
       memory                 = 4096
@@ -1104,14 +1130,41 @@ module "ha_airflow_ecs_cluster" {
             }
           ]
           environment = [
+            # Core Configuration
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
+
+            # Database Configuration
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+
+            # Celery Configuration
             { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+
+            # Logging Configuration
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" }
+
+            # Webserver Configuration - CRITICAL FOR CSRF AND LOAD BALANCER
+            { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" },
+            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = "changeme-generate-a-secure-key-here" },
+            { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+            { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY", value = "True" },
+            { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE", value = "Lax" },
+            { name = "AIRFLOW__WEBSERVER__COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+            { name = "AIRFLOW__WEBSERVER__COOKIE_SAMESITE", value = "Lax" },
+
+            # Session Backend - IMPORTANT: Use database for session storage
+            { name = "AIRFLOW__WEBSERVER__SESSION_BACKEND", value = "database" },
+
+            # Additional Webserver Settings
+            { name = "AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT", value = "120" },
+            { name = "AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL", value = "30" },
+            { name = "AIRFLOW__WEBSERVER__WORKER_CLASS", value = "sync" },
+
+            # Authentication
+            { name = "AIRFLOW__WEBSERVER__AUTHENTICATE", value = "True" },
+            { name = "AIRFLOW__WEBSERVER__AUTH_BACKEND", value = "airflow.api.auth.backend.basic_auth" }
           ]
           readonlyRootFilesystem    = false
           enable_cloudwatch_logging = true
@@ -1149,7 +1202,7 @@ module "ha_airflow_ecs_cluster" {
       memory                 = 4096
       task_exec_iam_role_arn = module.airflow_scheduler_task_execution_role.arn
       iam_role_arn           = module.airflow_scheduler_task_execution_role.arn
-      desired_count          = 2
+      desired_count          = 1 # IMPORTANT: Only run 1 scheduler at a time
       launch_type            = "FARGATE"
       assign_public_ip       = false
       deployment_controller = {
@@ -1190,11 +1243,13 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         scheduler = {
-          cpu       = 1024
-          memory    = 2048
+          cpu       = 2048 # Give scheduler more resources
+          memory    = 4096
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["scheduler"]
+
+          # Increase file descriptor limits
           ulimits = [
             {
               name      = "nofile"
@@ -1202,6 +1257,7 @@ module "ha_airflow_ecs_cluster" {
               hardLimit = 65536
             }
           ]
+
           mountPoints = [
             {
               sourceVolume  = "dags"
@@ -1214,17 +1270,69 @@ module "ha_airflow_ecs_cluster" {
               readOnly      = false
             }
           ]
+
           environment = [
+            # Core Configuration
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
+            { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" },
+            { name = "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG", value = "16" },
+            { name = "AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG", value = "16" },
+            { name = "AIRFLOW__CORE__PARALLELISM", value = "32" },
+            { name = "AIRFLOW__CORE__DAG_CONCURRENCY", value = "16" },
+
+            # Database Configuration
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE", value = "10" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW", value = "20" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE", value = "3600" },
+            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING", value = "True" },
+
+            # Celery Configuration
             { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+
+            # Logging Configuration
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" }
+            { name = "AIRFLOW__LOGGING__LOGGING_LEVEL", value = "INFO" },
+
+            # Scheduler Configuration - CRITICAL
+            { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC", value = "5" },
+            { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" },
+            { name = "AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL", value = "30" },
+            { name = "AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL", value = "30" },
+            { name = "AIRFLOW__SCHEDULER__PARSING_PROCESSES", value = "2" },
+            { name = "AIRFLOW__SCHEDULER__SCHEDULER_IDLE_SLEEP_TIME", value = "1" },
+            { name = "AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY", value = "512" },
+            { name = "AIRFLOW__SCHEDULER__USE_JOB_SCHEDULE", value = "True" },
+            { name = "AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE", value = "False" },
+            { name = "AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT", value = "False" },
+
+            # Performance tuning
+            { name = "AIRFLOW__SCHEDULER__ORPHANED_TASKS_CHECK_INTERVAL", value = "300" },
+            { name = "AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY", value = "/opt/airflow/logs/scheduler" },
+
+            # Health check
+            { name = "AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK", value = "True" },
+            { name = "AIRFLOW__SCHEDULER__HEALTH_CHECK_THRESHOLD", value = "30" }
           ]
+
           readOnlyRootFilesystem = false
+
+          # Health check for the container
+          healthCheck = {
+            command = [
+              "CMD-SHELL",
+              "airflow jobs check --job-type SchedulerJob --hostname \"$HOSTNAME\" || exit 1"
+            ]
+            interval    = 30
+            timeout     = 10
+            retries     = 3
+            startPeriod = 60
+          }
+
           logConfiguration = {
             logDriver = "awslogs"
             options = {
@@ -1233,18 +1341,22 @@ module "ha_airflow_ecs_cluster" {
               awslogs-stream-prefix = "scheduler"
             }
           }
+
           memoryReservation = 100
+
+          # Restart policy - Important for scheduler
           restartPolicy = {
             enabled              = true
-            ignoredExitCodes     = [1]
-            restartAttemptPeriod = 60
+            ignoredExitCodes     = []  # Don't ignore any exit codes
+            restartAttemptPeriod = 300 # Wait 5 minutes before restarting
           }
         }
       }
+
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
       security_group_ids            = [module.airflow_scheduler_sg.id]
-      availability_zone_rebalancing = "ENABLED"
+      availability_zone_rebalancing = "DISABLED" # Keep scheduler in same AZ
     }
 
     worker = {
