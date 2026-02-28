@@ -22,11 +22,11 @@ locals {
   redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
 
   # Get the secret key
-  airflow_secret_key = random_password.airflow_secret_key.result
+  airflow_secret_key = nonsensitive(random_password.airflow_secret_key.result)
 
   # Build connection strings in locals
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
-  celery_broker_url     = "redis://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
+  celery_broker_url     = "rediss://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
   celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
 }
 
@@ -477,7 +477,7 @@ module "airflow_dags_efs" {
       creation_info = {
         owner_gid   = 50000 # airflow group
         owner_uid   = 50000 # airflow user
-        permissions = "755"
+        permissions = "777"
       }
       posix_user = {
         gid = 50000
@@ -492,7 +492,7 @@ module "airflow_dags_efs" {
       creation_info = {
         owner_gid   = 50000
         owner_uid   = 50000
-        permissions = "755"
+        permissions = "777"
       }
       posix_user = {
         gid = 50000
@@ -500,6 +500,18 @@ module "airflow_dags_efs" {
       }
       tags = {
         Component = "plugins"
+      }
+    }
+    logs = {
+      root_directory_path = "/logs" # Correct parameter name
+      creation_info = {
+        owner_gid   = 50000
+        owner_uid   = 50000
+        permissions = "777"
+      }
+      posix_user = {
+        gid = 50000
+        uid = 50000
       }
     }
   }
@@ -1073,9 +1085,8 @@ module "ha_airflow_ecs_cluster" {
       volume = {
         dags = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
               iam             = "ENABLED"
@@ -1084,11 +1095,20 @@ module "ha_airflow_ecs_cluster" {
         }
         plugins = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2999
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+        logs = {
+          efs_volume_configuration = {
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["logs"]
               iam             = "ENABLED"
             }
           }
@@ -1127,6 +1147,11 @@ module "ha_airflow_ecs_cluster" {
               sourceVolume  = "plugins"
               containerPath = "/opt/airflow/plugins"
               readOnly      = false
+            },
+            {
+              sourceVolume  = "logs"
+              containerPath = "/opt/airflow/logs"
+              readOnly      = false
             }
           ]
           environment = [
@@ -1147,9 +1172,10 @@ module "ha_airflow_ecs_cluster" {
 
             # Webserver Configuration - CRITICAL FOR CSRF AND LOAD BALANCER
             { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" },
-            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = "changeme-generate-a-secure-key-here" },
+            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
             { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
             { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY", value = "True" },
+            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
             { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE", value = "Lax" },
             { name = "AIRFLOW__WEBSERVER__COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
             { name = "AIRFLOW__WEBSERVER__COOKIE_SAMESITE", value = "Lax" },
@@ -1164,9 +1190,12 @@ module "ha_airflow_ecs_cluster" {
 
             # Authentication
             { name = "AIRFLOW__WEBSERVER__AUTHENTICATE", value = "True" },
-            { name = "AIRFLOW__WEBSERVER__AUTH_BACKEND", value = "airflow.api.auth.backend.basic_auth" }
+            { name = "AIRFLOW__WEBSERVER__AUTH_BACKEND", value = "airflow.api.auth.backend.basic_auth" },
+            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
           ]
-          readonlyRootFilesystem    = false
+          readOnlyRootFilesystem    = false
           enable_cloudwatch_logging = true
           logConfiguration = {
             logDriver = "awslogs"
@@ -1219,9 +1248,8 @@ module "ha_airflow_ecs_cluster" {
       volume = {
         dags = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
               iam             = "ENABLED"
@@ -1230,11 +1258,20 @@ module "ha_airflow_ecs_cluster" {
         }
         plugins = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2999
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+        logs = {
+          efs_volume_configuration = {
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["logs"]
               iam             = "ENABLED"
             }
           }
@@ -1268,12 +1305,18 @@ module "ha_airflow_ecs_cluster" {
               sourceVolume  = "plugins"
               containerPath = "/opt/airflow/plugins"
               readOnly      = false
+            },
+            {
+              sourceVolume  = "logs"
+              containerPath = "/opt/airflow/logs"
+              readOnly      = false
             }
           ]
 
           environment = [
             # Core Configuration
             { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
             { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
             { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" },
             { name = "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG", value = "16" },
@@ -1294,6 +1337,8 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
 
             # Logging Configuration
+
+
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
             { name = "AIRFLOW__LOGGING__LOGGING_LEVEL", value = "INFO" },
@@ -1307,16 +1352,20 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_IDLE_SLEEP_TIME", value = "1" },
             { name = "AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY", value = "512" },
             { name = "AIRFLOW__SCHEDULER__USE_JOB_SCHEDULE", value = "True" },
+            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
             { name = "AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE", value = "False" },
             { name = "AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT", value = "False" },
 
             # Performance tuning
             { name = "AIRFLOW__SCHEDULER__ORPHANED_TASKS_CHECK_INTERVAL", value = "300" },
-            { name = "AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY", value = "/opt/airflow/logs/scheduler" },
+            # { name = "AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY", value = "/opt/airflow/logs/scheduler" },
 
             # Health check
             { name = "AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK", value = "True" },
-            { name = "AIRFLOW__SCHEDULER__HEALTH_CHECK_THRESHOLD", value = "30" }
+            { name = "AIRFLOW__SCHEDULER__HEALTH_CHECK_THRESHOLD", value = "30" },
+            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
           ]
 
           readOnlyRootFilesystem = false
@@ -1381,9 +1430,8 @@ module "ha_airflow_ecs_cluster" {
       volume = {
         dags = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2049
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["dags"]
               iam             = "ENABLED"
@@ -1392,11 +1440,20 @@ module "ha_airflow_ecs_cluster" {
         }
         plugins = {
           efs_volume_configuration = {
-            file_system_id          = module.airflow_dags_efs.id
-            transit_encryption      = "ENABLED"
-            transit_encryption_port = 2999
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
             authorization_config = {
               access_point_id = module.airflow_dags_efs.access_point_ids["plugins"]
+              iam             = "ENABLED"
+            }
+          }
+        }
+        logs = {
+          efs_volume_configuration = {
+            file_system_id     = module.airflow_dags_efs.id
+            transit_encryption = "ENABLED"
+            authorization_config = {
+              access_point_id = module.airflow_dags_efs.access_point_ids["logs"]
               iam             = "ENABLED"
             }
           }
@@ -1427,6 +1484,11 @@ module "ha_airflow_ecs_cluster" {
               sourceVolume  = "plugins"
               containerPath = "/opt/airflow/plugins"
               readOnly      = false
+            },
+            {
+              sourceVolume  = "logs"
+              containerPath = "/opt/airflow/logs"
+              readOnly      = false
             }
           ]
           environment = [
@@ -1437,7 +1499,11 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
             { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
             { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" }
+            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" }, # <-- ADD THIS LINE
+            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
           ]
           readOnlyRootFilesystem = false
           logConfiguration = {
