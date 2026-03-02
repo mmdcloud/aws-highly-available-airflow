@@ -14,27 +14,62 @@ module "airflow_webserver_secret_key" {
 }
 
 locals {
-  rds_username     = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
-  rds_password     = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
-  redis_auth_token = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
-
-  # Use primary_endpoint_address instead of configuration_endpoint_address
-  redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
-
-  # Get the secret key
+  rds_username       = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
+  rds_password       = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
+  redis_auth_token   = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
+  fernet_key         = nonsensitive(tostring(data.vault_generic_secret.airflow.data["fernet_key"]))
   airflow_secret_key = nonsensitive(random_password.airflow_secret_key.result)
+  redis_endpoint     = module.airflow_redis_cache.primary_endpoint_address
 
-  # Build connection strings in locals
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
   celery_broker_url     = "rediss://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
   celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+
+  # Shared env vars every container needs — define once, reuse everywhere
+  common_env = [
+    { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+    { name = "AIRFLOW__CORE__FERNET_KEY", value = local.fernet_key },
+    { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
+    { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+    { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" },
+    { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+    { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+    { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+    { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+    { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
+    { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+    { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
+    { name = "AIRFLOW__LOGGING__LOGGING_LEVEL", value = "INFO" },
+    { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
+  ]
 }
+
+# locals {
+#   rds_username     = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
+#   rds_password     = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
+#   redis_auth_token = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
+
+#   # Use primary_endpoint_address instead of configuration_endpoint_address
+#   redis_endpoint = module.airflow_redis_cache.primary_endpoint_address
+
+#   # Get the secret key
+#   airflow_secret_key = nonsensitive(random_password.airflow_secret_key.result)
+
+#   # Build connection strings in locals
+#   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+#   celery_broker_url     = "rediss://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
+#   celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+# }
 
 # -----------------------------------------------------------------------------------------
 # Data Sources
 # -----------------------------------------------------------------------------------------
 data "vault_generic_secret" "rds" {
   path = "secret/rds"
+}
+
+data "vault_generic_secret" "airflow" {
+  path = "secret/airflow"
 }
 
 data "aws_elb_service_account" "main" {}
@@ -1000,11 +1035,14 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
       name      = "db-init"
       image     = "apache/airflow:2.10.4"
       essential = true
-      command   = ["db", "init"]
+      command   = ["db", "migrate"]
 
-      environment = [
-        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
-      ]
+      # environment = [
+      #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
+      # ]
+      environment = concat(local.common_env, [
+        { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" }
+      ])
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -1042,9 +1080,10 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
         "--password", "admin123"
       ]
 
-      environment = [
-        { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
-      ]
+      # environment = [
+      #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
+      # ]
+      environment = local.common_env
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -1154,47 +1193,67 @@ module "ha_airflow_ecs_cluster" {
               readOnly      = false
             }
           ]
-          environment = [
-            # Core Configuration
-            { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
 
-            # Database Configuration
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+          # environment = [
+          #   # Core Configuration
+          #   { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+          #   { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
 
-            # Celery Configuration
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+          #   # Database Configuration
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
 
-            # Logging Configuration
-            { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+          #   # Celery Configuration
+          #   { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+          #   { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
 
-            # Webserver Configuration - CRITICAL FOR CSRF AND LOAD BALANCER
+          #   # Logging Configuration
+          #   { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
+          #   { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+
+          #   # Webserver Configuration - CRITICAL FOR CSRF AND LOAD BALANCER
+          #   { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" },
+          #   { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
+          #   { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+          #   { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY", value = "True" },
+          #   { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
+          #   { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE", value = "Lax" },
+          #   { name = "AIRFLOW__WEBSERVER__COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+          #   { name = "AIRFLOW__WEBSERVER__COOKIE_SAMESITE", value = "Lax" },
+
+          #   # Session Backend - IMPORTANT: Use database for session storage
+          #   { name = "AIRFLOW__WEBSERVER__SESSION_BACKEND", value = "database" },
+
+          #   # Additional Webserver Settings
+          #   { name = "AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT", value = "120" },
+          #   { name = "AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL", value = "30" },
+          #   { name = "AIRFLOW__WEBSERVER__WORKER_CLASS", value = "sync" },
+
+          #   # Authentication
+          #   { name = "AIRFLOW__WEBSERVER__AUTHENTICATE", value = "True" },
+          #   { name = "AIRFLOW__WEBSERVER__AUTH_BACKEND", value = "airflow.api.auth.backend.basic_auth" },
+          #   { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+          #   { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+          #   { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
+          # ]
+          environment = concat(local.common_env, [
+            # Proxy / cookie config for ALB
             { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" },
-            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
-            { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+            { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SECURE", value = "False" }, # set True when HTTPS
             { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_HTTPONLY", value = "True" },
-            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
             { name = "AIRFLOW__WEBSERVER__SESSION_COOKIE_SAMESITE", value = "Lax" },
-            { name = "AIRFLOW__WEBSERVER__COOKIE_SECURE", value = "False" }, # Set to True if using HTTPS
+            { name = "AIRFLOW__WEBSERVER__COOKIE_SECURE", value = "False" }, # set True when HTTPS
             { name = "AIRFLOW__WEBSERVER__COOKIE_SAMESITE", value = "Lax" },
-
-            # Session Backend - IMPORTANT: Use database for session storage
             { name = "AIRFLOW__WEBSERVER__SESSION_BACKEND", value = "database" },
 
-            # Additional Webserver Settings
+            # Worker / timeout settings
             { name = "AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT", value = "120" },
             { name = "AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL", value = "30" },
             { name = "AIRFLOW__WEBSERVER__WORKER_CLASS", value = "sync" },
 
-            # Authentication
+            # Auth
             { name = "AIRFLOW__WEBSERVER__AUTHENTICATE", value = "True" },
             { name = "AIRFLOW__WEBSERVER__AUTH_BACKEND", value = "airflow.api.auth.backend.basic_auth" },
-            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
-            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
-            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
-          ]
+          ])
           readOnlyRootFilesystem    = false
           enable_cloudwatch_logging = true
           logConfiguration = {
@@ -1313,37 +1372,79 @@ module "ha_airflow_ecs_cluster" {
             }
           ]
 
-          environment = [
-            # Core Configuration
-            { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
-            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-            { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" },
+          # environment = [
+          #   # Core Configuration
+          #   { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+          #   { name = "AIRFLOW__WEBSERVER__SECRET_KEY", value = local.airflow_secret_key },
+          #   { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
+          #   { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" },
+          #   { name = "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG", value = "16" },
+          #   { name = "AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG", value = "16" },
+          #   { name = "AIRFLOW__CORE__PARALLELISM", value = "32" },
+          #   { name = "AIRFLOW__CORE__DAG_CONCURRENCY", value = "16" },
+
+          #   # Database Configuration
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE", value = "10" },
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW", value = "20" },
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE", value = "3600" },
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING", value = "True" },
+
+          #   # Celery Configuration
+          #   { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+          #   { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+          #   { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+
+          #   # Logging Configuration
+
+
+          #   { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
+          #   { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+          #   { name = "AIRFLOW__LOGGING__LOGGING_LEVEL", value = "INFO" },
+
+          #   # Scheduler Configuration - CRITICAL
+          #   { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC", value = "5" },
+          #   { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" },
+          #   { name = "AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL", value = "30" },
+          #   { name = "AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL", value = "30" },
+          #   { name = "AIRFLOW__SCHEDULER__PARSING_PROCESSES", value = "2" },
+          #   { name = "AIRFLOW__SCHEDULER__SCHEDULER_IDLE_SLEEP_TIME", value = "1" },
+          #   { name = "AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY", value = "512" },
+          #   { name = "AIRFLOW__SCHEDULER__USE_JOB_SCHEDULE", value = "True" },
+          #   { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
+          #   { name = "AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE", value = "False" },
+          #   { name = "AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT", value = "False" },
+
+          #   # Performance tuning
+          #   { name = "AIRFLOW__SCHEDULER__ORPHANED_TASKS_CHECK_INTERVAL", value = "300" },
+          #   # { name = "AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY", value = "/opt/airflow/logs/scheduler" },
+
+          #   # Health check
+          #   { name = "AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK", value = "True" },
+          #   { name = "AIRFLOW__SCHEDULER__HEALTH_CHECK_THRESHOLD", value = "30" },
+          #   { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+          #   { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+          #   { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
+          # ]
+
+          environment = concat(local.common_env, [
+            # Parallelism
+            { name = "AIRFLOW__CORE__PARALLELISM", value = "32" },
             { name = "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG", value = "16" },
             { name = "AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG", value = "16" },
-            { name = "AIRFLOW__CORE__PARALLELISM", value = "32" },
             { name = "AIRFLOW__CORE__DAG_CONCURRENCY", value = "16" },
+            { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "True" },
 
-            # Database Configuration
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+            # DB connection pool
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE", value = "10" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW", value = "20" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_RECYCLE", value = "3600" },
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING", value = "True" },
 
-            # Celery Configuration
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+            # Celery
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
 
-            # Logging Configuration
-
-
-            { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            { name = "AIRFLOW__LOGGING__LOGGING_LEVEL", value = "INFO" },
-
-            # Scheduler Configuration - CRITICAL
+            # Scheduler tuning
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC", value = "5" },
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD", value = "30" },
             { name = "AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL", value = "30" },
@@ -1352,35 +1453,26 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_IDLE_SLEEP_TIME", value = "1" },
             { name = "AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY", value = "512" },
             { name = "AIRFLOW__SCHEDULER__USE_JOB_SCHEDULE", value = "True" },
-            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
             { name = "AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE", value = "False" },
             { name = "AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT", value = "False" },
-
-            # Performance tuning
             { name = "AIRFLOW__SCHEDULER__ORPHANED_TASKS_CHECK_INTERVAL", value = "300" },
-            # { name = "AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY", value = "/opt/airflow/logs/scheduler" },
-
-            # Health check
             { name = "AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK", value = "True" },
             { name = "AIRFLOW__SCHEDULER__HEALTH_CHECK_THRESHOLD", value = "30" },
-            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
-            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
-            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
-          ]
+          ])
 
           readOnlyRootFilesystem = false
 
           # Health check for the container
-          healthCheck = {
-            command = [
-              "CMD-SHELL",
-              "airflow jobs check --job-type SchedulerJob --hostname \"$HOSTNAME\" || exit 1"
-            ]
-            interval    = 30
-            timeout     = 10
-            retries     = 3
-            startPeriod = 60
-          }
+          # healthCheck = {
+          #   command = [
+          #     "CMD-SHELL",
+          #     "airflow jobs check --job-type SchedulerJob --hostname \"$HOSTNAME\" || exit 1"
+          #   ]
+          #   interval    = 30
+          #   timeout     = 10
+          #   retries     = 3
+          #   startPeriod = 60
+          # }
 
           logConfiguration = {
             logDriver = "awslogs"
@@ -1491,20 +1583,23 @@ module "ha_airflow_ecs_cluster" {
               readOnly      = false
             }
           ]
-          environment = [
-            { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
-            { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-            { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
-            { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
-            { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
-            { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
-            { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
-            { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" }, # <-- ADD THIS LINE
+          # environment = [
+          #   { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
+          #   { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
+          #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
+          #   { name = "AIRFLOW__CELERY__BROKER_URL", value = local.celery_broker_url },
+          #   { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = local.celery_result_backend },
+          #   { name = "AIRFLOW__LOGGING__REMOTE_LOGGING", value = "True" },
+          #   { name = "AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER", value = "s3://${module.airflow_logs_bucket.bucket}" },
+          #   { name = "AIRFLOW__LOGGING__BASE_LOG_FOLDER", value = "/opt/airflow/logs" },
+          #   { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+          #   { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+          #   { name = "AIRFLOW_HOME", value = "/opt/airflow" },
+          #   { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
+          # ]
+          environment = concat(local.common_env, [
             { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
-            { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
-            { name = "AIRFLOW_HOME", value = "/opt/airflow" },
-            { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" }
-          ]
+          ])
           readOnlyRootFilesystem = false
           logConfiguration = {
             logDriver = "awslogs"
@@ -1530,7 +1625,8 @@ module "ha_airflow_ecs_cluster" {
   }
   depends_on = [
     module.airflow_redis_cache,
-    module.webserver_lb
+    module.webserver_lb,
+    module.airflow_metadata_db
   ]
 }
 
@@ -1543,18 +1639,48 @@ resource "null_resource" "airflow_db_init" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      aws ecs run-task \
-        --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
-        --task-definition ${aws_ecs_task_definition.airflow_db_init.family} \
-        --launch-type FARGATE \
-        --region ${var.region} \
-        --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
-        --query 'tasks[0].taskArn' \
-        --output text
+    TASK_ARN=$(aws ecs run-task \
+      --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+      --task-definition ${aws_ecs_task_definition.airflow_db_init.family} \
+      --launch-type FARGATE \
+      --region ${var.region} \
+      --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
+      --query 'tasks[0].taskArn' \
+      --output text)
 
-      echo "Waiting for DB initialization to complete..."
-      sleep 180
-    EOT
+    echo "Waiting for db init task $TASK_ARN to complete..."
+    aws ecs wait tasks-stopped \
+      --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+      --tasks $TASK_ARN \
+      --region ${var.region}
+
+    EXIT_CODE=$(aws ecs describe-tasks \
+      --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+      --tasks $TASK_ARN \
+      --region ${var.region} \
+      --query 'tasks[0].containers[0].exitCode' \
+      --output text)
+
+    if [ "$EXIT_CODE" != "0" ]; then
+      echo "ERROR: db init failed with exit code $EXIT_CODE. Check CloudWatch logs."
+      exit 1
+    fi
+
+    echo "DB init completed successfully."
+  EOT
+    # command = <<-EOT
+    #   aws ecs run-task \
+    #     --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
+    #     --task-definition ${aws_ecs_task_definition.airflow_db_init.family} \
+    #     --launch-type FARGATE \
+    #     --region ${var.region} \
+    #     --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
+    #     --query 'tasks[0].taskArn' \
+    #     --output text
+
+    #   echo "Waiting for DB initialization to complete..."
+    #   sleep 180
+    # EOT
   }
 
   triggers = {
