@@ -1036,7 +1036,12 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
       image     = "apache/airflow:2.10.4"
       essential = true
       command   = ["db", "migrate"]
-
+      linuxParameters = { # ← ADD HERE
+        tmpfs = [
+          { containerPath = "/tmp", size = 512 },
+          { containerPath = "/opt/airflow", size = 256 }
+        ]
+      }
       # environment = [
       #   { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn }
       # ]
@@ -1070,6 +1075,12 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
       name      = "create-user"
       image     = "apache/airflow:2.10.4"
       essential = true
+      linuxParameters = { # ← ADD HERE
+        tmpfs = [
+          { containerPath = "/tmp", size = 512 },
+          { containerPath = "/opt/airflow", size = 256 }
+        ]
+      }
       command = [
         "users", "create",
         "--username", "admin",
@@ -1161,6 +1172,12 @@ module "ha_airflow_ecs_cluster" {
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["webserver"]
+          linuxParameters = { # ← ADD HERE
+            tmpfs = [
+              { containerPath = "/tmp", size = 512 },
+              { containerPath = "/opt/airflow", size = 256 }
+            ]
+          }
           ulimits = [
             {
               name      = "nofile"
@@ -1344,7 +1361,12 @@ module "ha_airflow_ecs_cluster" {
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["scheduler"]
-
+          linuxParameters = { # ← ADD HERE
+            tmpfs = [
+              { containerPath = "/tmp", size = 512 },
+              { containerPath = "/opt/airflow", size = 256 }
+            ]
+          }
           # Increase file descriptor limits
           ulimits = [
             {
@@ -1559,6 +1581,12 @@ module "ha_airflow_ecs_cluster" {
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["celery", "worker"]
+          linuxParameters = { # ← ADD HERE
+            tmpfs = [
+              { containerPath = "/tmp", size = 512 },
+              { containerPath = "/opt/airflow", size = 256 }
+            ]
+          }
           ulimits = [
             {
               name      = "nofile"
