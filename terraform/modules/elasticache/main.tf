@@ -36,9 +36,7 @@ resource "aws_elasticache_replication_group" "replication_group" {
       destination_type = log_delivery_configuration.value.destination_type
     }
   }
-  tags = {
-    Name = var.replication_group_id
-  }
+  tags = concat({},var.tags)
 }
 
 resource "aws_elasticache_subnet_group" "subnet_group_name" {

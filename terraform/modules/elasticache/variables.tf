@@ -30,3 +30,7 @@ variable "at_rest_encryption_enabled" {}
 variable "transit_encryption_enabled" {}
 variable "auth_token_enabled" {}
 variable "auth_token" {}
+variable "tags" {
+  type = map(string)
+  default = {}
+}
