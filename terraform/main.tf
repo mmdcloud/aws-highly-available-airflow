@@ -1,3 +1,5 @@
+data "aws_caller_identity" "current" {}
+
 resource "random_password" "airflow_secret_key" {
   length  = 32
   special = true
@@ -536,7 +538,7 @@ module "airflow_dags_efs" {
       creation_info = {
         owner_gid   = 50000 # airflow group
         owner_uid   = 50000 # airflow user
-        permissions = "777"
+        permissions = "755"
       }
       posix_user = {
         gid = 50000
@@ -551,7 +553,7 @@ module "airflow_dags_efs" {
       creation_info = {
         owner_gid   = 50000
         owner_uid   = 50000
-        permissions = "777"
+        permissions = "755"
       }
       posix_user = {
         gid = 50000
@@ -562,11 +564,11 @@ module "airflow_dags_efs" {
       }
     }
     logs = {
-      root_directory_path = "/logs" # Correct parameter name
+      root_directory_path = "/logs"
       creation_info = {
         owner_gid   = 50000
         owner_uid   = 50000
-        permissions = "777"
+        permissions = "750"
       }
       posix_user = {
         gid = 50000
@@ -1545,7 +1547,7 @@ module "ha_airflow_ecs_cluster" {
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["celery", "worker"]
-          linuxParameters = { # ← ADD HERE
+          linuxParameters = {
             tmpfs = [
               { containerPath = "/tmp", size = 512 },
               { containerPath = "/opt/airflow", size = 256 }
@@ -1861,5 +1863,87 @@ module "alb_unhealthy_targets" {
   dimensions = {
     TargetGroup  = module.webserver_lb.target_groups["webserver_lb_target_group"].arn_suffix
     LoadBalancer = module.webserver_lb.arn_suffix
+  }
+}
+
+# -----------------------------------------------------------------------------------------
+# WAF Configuration
+# -----------------------------------------------------------------------------------------
+module "waf" {
+  source = "./modules/waf"
+
+  # Naming — matches your existing convention
+  name = "airflow-lb-webserver-waf"
+
+  # Attach WAF to the public-facing Frontend ALB
+  # Replace with your actual frontend ALB ARN output
+  frontend_alb_arn = module.webserver_lb.arn
+
+  # Reuse your existing SNS alarm topic — no new infra needed
+  alarm_topic_arn = module.alarm_notifications.arn
+
+  # Account + region for log resource policy
+  account_id = data.aws_caller_identity.current.account_id
+  aws_region = var.region
+
+  # ---------------------------------------------------
+  # IP Management
+  # ---------------------------------------------------
+
+  # IPs to always block — add known attackers, threat intel here
+  blocked_ip_list = [
+    # "203.0.113.0/24",  # Example: known scanner range
+  ]
+
+  # IPs that bypass rate limiting — office, CI/CD, trusted partners
+  allowed_ip_list = [
+    # "YOUR_OFFICE_IP/32",
+    # "YOUR_CICD_RUNNER_IP/32",
+  ]
+
+  # ---------------------------------------------------
+  # Geo Blocking
+  # ---------------------------------------------------
+
+  # Block countries not in your target market
+  # Remove or leave empty [] if you serve global traffic
+  blocked_countries = [
+    # "KP",  # North Korea
+    # "IR",  # Iran
+    # "CU",  # Cuba
+    # "SY",  # Syria
+  ]
+
+  # ---------------------------------------------------
+  # Rate Limiting
+  # ---------------------------------------------------
+
+  # General rate limit per IP per 5-minute window
+  # 2000 = ~6-7 requests/second — comfortable for real users, blocks bots
+  rate_limit_requests = 2000
+
+  # Auth endpoints get a much tighter limit
+  # 100 = ~1 login attempt every 3 seconds per IP
+  auth_rate_limit_requests = 100
+
+  # ---------------------------------------------------
+  # Logging
+  # ---------------------------------------------------
+
+  # How long to keep WAF logs in CloudWatch
+  log_retention_days = 90
+
+  # ---------------------------------------------------
+  # Alarm Thresholds — tune after observing normal traffic
+  # ---------------------------------------------------
+
+  alarm_blocked_requests_threshold = 500   # > 500 total blocks in 5 min = alert
+  alarm_rate_limit_threshold       = 100   # > 100 rate-limit hits in 5 min = alert
+  alarm_auth_rate_limit_threshold  = 20    # > 20 auth blocks in 5 min = alert
+
+  tags = {
+    Name = "airflow-lb-webserver-waf"
+    Project = "ha-airflow"
+    ManagedBy = "terraform"
   }
 }
