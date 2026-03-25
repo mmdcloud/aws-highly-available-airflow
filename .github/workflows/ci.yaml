@@ -1,0 +1,478 @@
+name: "DAG CI — Lint · Validate · Scan · Test"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "dags/**"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/dag-*.yml"
+  workflow_dispatch: {}
+
+# ── Principle of least privilege ───────────────────────────────────────────────
+permissions:
+  contents: read
+  pull-requests: write      # post PR summary comment
+  security-events: write    # upload SARIF findings
+
+# Cancel older runs on the same PR; never cancel on main
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# ── Shared across all jobs ──────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+  AIRFLOW_VERSION: "2.9.3"
+  # Dummy non-sensitive Airflow env for validation only — NOT production values
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
+  AIRFLOW__WEBSERVER__SECRET_KEY: "ci-only-not-a-real-secret"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 1 — Lint & Format
+# ═══════════════════════════════════════════════════════════════════════════════
+jobs:
+  lint:
+    name: "Lint & Format"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # pinned by commit SHA — never use @latest in production
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint tools
+        run: |
+          pip install --upgrade pip --quiet
+          pip install black==24.3.0 isort==5.13.2 flake8==7.0.0 pylint==3.1.0 --quiet
+
+      - name: black — format check
+        run: black --check --diff dags/ tests/ 2>&1 | tee /tmp/black.txt
+        continue-on-error: true
+
+      - name: isort — import order
+        run: isort --check-only --diff dags/ tests/ 2>&1 | tee /tmp/isort.txt
+        continue-on-error: true
+
+      - name: flake8 — style & errors
+        run: |
+          flake8 dags/ tests/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s'
+
+      - name: pylint — static analysis
+        run: |
+          pylint dags/ \
+            --disable=C0114,C0115,C0116,W0611 \
+            --fail-under=8.0 \
+            --output-format=colorized
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Security Scanning (SAST + SCA + Secrets)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  security:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for secret scanning)
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install security tools
+        run: pip install bandit[toml]==1.7.8 pip-audit==2.7.3 detect-secrets==1.4.0 --quiet
+
+      # ── SAST: Bandit ─────────────────────────────────────────────────────────
+      - name: Bandit — SAST (Python security linter)
+        run: |
+          bandit -r dags/ \
+            --severity-level medium \
+            --confidence-level medium \
+            --format sarif \
+            --output bandit.sarif || true   # continue so SARIF is always uploaded
+
+      - name: Upload Bandit SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.9
+        if: always()
+        with:
+          sarif_file: bandit.sarif
+          category: bandit-dags
+
+      # ── SCA: pip-audit ───────────────────────────────────────────────────────
+      - name: pip-audit — dependency vulnerability scan
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt \
+              --format=columns \
+              --desc \
+              --strict
+          else
+            echo "No requirements.txt found, skipping pip-audit"
+          fi
+
+      # ── Credential / Secret Detection ────────────────────────────────────────
+      - name: detect-secrets — scan for hardcoded credentials
+        run: |
+          # Generate fresh scan results
+          detect-secrets scan dags/ \
+            --exclude-files '.*\.pyc$' \
+            --exclude-files '__pycache__' \
+            > /tmp/secrets_scan.json
+          
+          SECRET_COUNT=$(python3 -c "
+          import json, sys
+          data = json.load(open('/tmp/secrets_scan.json'))
+          total = sum(len(v) for v in data.get('results', {}).values())
+          print(total)
+          ")
+          
+          if [ "$SECRET_COUNT" -gt 0 ]; then
+            echo "::error::$SECRET_COUNT potential secrets detected in DAGs!"
+            cat /tmp/secrets_scan.json | python3 -m json.tool
+            exit 1
+          fi
+          echo "✅ No secrets detected"
+
+      - name: Gitleaks — git history secret scan
+        uses: gitleaks/gitleaks-action@cb7149a9b57195b609c63e8518d2c6ef14f7abca # v2.3.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Hardcoded AWS credential pattern check ───────────────────────────────
+      - name: Check for hardcoded AWS credentials
+        run: |
+          FOUND=0
+          
+          # AWS Access Key IDs
+          if grep -rEn 'AKIA[0-9A-Z]{16}' dags/ --include="*.py"; then
+            echo "::error::AWS Access Key ID pattern found in DAGs!"
+            FOUND=1
+          fi
+          
+          # AWS Secret-like 40-char base64 strings in known credential contexts
+          if grep -rEn '(aws_secret_access_key|AWS_SECRET)\s*[=:]\s*[A-Za-z0-9/+]{40}' dags/ --include="*.py"; then
+            echo "::error::Potential AWS Secret Access Key found in DAGs!"
+            FOUND=1
+          fi
+          
+          # Common connection string patterns with embedded passwords
+          if grep -rEn '(postgresql|mysql|redis)s?://[^:]+:[^@]{6,}@' dags/ --include="*.py"; then
+            echo "::error::Hardcoded DB/Redis connection string with credentials found!"
+            FOUND=1
+          fi
+          
+          [ "$FOUND" -eq 0 ] && echo "✅ No hardcoded AWS credentials found"
+          exit "$FOUND"
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Airflow DAG Validation
+  # ═══════════════════════════════════════════════════════════════════════════════
+  validate-dags:
+    name: "Validate DAGs"
+    runs-on: ubuntu-latest
+    needs: [lint]
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: airflow
+          POSTGRES_PASSWORD: airflow
+          POSTGRES_DB: airflow
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@localhost:5432/airflow
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache Airflow installation
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        id: airflow-cache
+        with:
+          path: ~/.local/lib/python${{ env.PYTHON_VERSION }}/site-packages
+          key: airflow-${{ env.AIRFLOW_VERSION }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            airflow-${{ env.AIRFLOW_VERSION }}-py${{ env.PYTHON_VERSION }}-
+
+      - name: Install Airflow (constraint-pinned)
+        if: steps.airflow-cache.outputs.cache-hit != 'true'
+        run: |
+          pip install --upgrade pip --quiet
+          # Always install with official constraints to prevent dependency conflicts
+          CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${{ env.AIRFLOW_VERSION }}/constraints-${{ env.PYTHON_VERSION }}.txt"
+          pip install "apache-airflow==${{ env.AIRFLOW_VERSION }}" \
+            --constraint "$CONSTRAINT_URL" \
+            --quiet
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt --constraint "$CONSTRAINT_URL" --quiet
+          fi
+
+      - name: Initialize Airflow DB
+        run: airflow db migrate
+
+      # ── Step 1: Python syntax check ──────────────────────────────────────────
+      - name: Python syntax check (compileall)
+        run: |
+          python -m compileall dags/ -q
+          echo "✅ All DAG files compile cleanly"
+
+      # ── Step 2: DAG loading & import error check ─────────────────────────────
+      - name: Check DAG import errors
+        run: |
+          python - <<'PYEOF'
+          import sys
+          sys.path.insert(0, 'dags')
+          from airflow.models import DagBag
+
+          dagbag = DagBag(dag_folder='dags', include_examples=False)
+
+          if dagbag.import_errors:
+              print("::error::DAG import errors detected!")
+              for dag_file, error in dagbag.import_errors.items():
+                  print(f"::error file={dag_file}::{error}")
+              sys.exit(1)
+
+          print(f"✅ {len(dagbag.dags)} DAGs loaded with zero import errors")
+          PYEOF
+
+      # ── Step 3: Cycle detection ──────────────────────────────────────────────
+      - name: Detect task dependency cycles
+        run: |
+          python - <<'PYEOF'
+          import sys
+          sys.path.insert(0, 'dags')
+          from airflow.models import DagBag
+
+          dagbag = DagBag(dag_folder='dags', include_examples=False)
+          errors = []
+
+          for dag_id, dag in dagbag.dags.items():
+              try:
+                  dag.test_cycle()
+              except Exception as e:
+                  errors.append(f"DAG '{dag_id}': {e}")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+
+          print(f"✅ No cycles in {len(dagbag.dags)} DAGs")
+          PYEOF
+
+      # ── Step 4: Best practice enforcement ───────────────────────────────────
+      - name: Enforce DAG best practices
+        run: |
+          python - <<'PYEOF'
+          import sys
+          sys.path.insert(0, 'dags')
+          from airflow.models import DagBag
+
+          dagbag = DagBag(dag_folder='dags', include_examples=False)
+          warnings, errors = [], []
+
+          for dag_id, dag in dagbag.dags.items():
+              # ── Hard errors ──────────────────────────────────────────────────
+              if dag.start_date is None and dag.default_args.get('start_date') is None:
+                  errors.append(f"DAG '{dag_id}': missing start_date")
+
+              if dag.default_args.get('email_on_failure') and not dag.default_args.get('email'):
+                  errors.append(f"DAG '{dag_id}': email_on_failure=True but no email configured")
+
+              # Tasks using BashOperator with shell=True without disabling
+              for task in dag.tasks:
+                  task_class = type(task).__name__
+                  if task_class == 'BashOperator':
+                      cmd = getattr(task, 'bash_command', '')
+                      if isinstance(cmd, str) and ('curl' in cmd or 'wget' in cmd) and 'https://' not in cmd:
+                          warnings.append(f"DAG '{dag_id}' task '{task.task_id}': HTTP (non-TLS) in BashOperator")
+
+              # ── Warnings ─────────────────────────────────────────────────────
+              if not dag.tags:
+                  warnings.append(f"DAG '{dag_id}': no tags set (add owner/team/domain tags)")
+
+              if dag.catchup:
+                  warnings.append(f"DAG '{dag_id}': catchup=True — ensure this is intentional")
+
+              if dag.default_args.get('retries') is None:
+                  warnings.append(f"DAG '{dag_id}': no default retries configured")
+
+              if dag.default_args.get('retry_delay') is None:
+                  warnings.append(f"DAG '{dag_id}': no retry_delay configured")
+
+          for w in warnings:
+              print(f"::warning::{w}")
+          for e in errors:
+              print(f"::error::{e}")
+
+          if errors:
+              print(f"\n❌ {len(errors)} error(s) must be fixed before merge")
+              sys.exit(1)
+
+          print(f"\n✅ Best practices check passed ({len(warnings)} warnings, {len(errors)} errors)")
+          PYEOF
+
+      # ── Step 5: Generate DAG inventory (posted to PR) ────────────────────────
+      - name: Generate DAG inventory report
+        id: inventory
+        run: |
+          python - <<'PYEOF' > /tmp/dag_inventory.md
+          import sys
+          sys.path.insert(0, 'dags')
+          from airflow.models import DagBag
+
+          dagbag = DagBag(dag_folder='dags', include_examples=False)
+          dags = sorted(dagbag.dags.items())
+
+          print("## 📋 DAG Inventory\n")
+          print(f"**Total:** {len(dags)} DAGs  |  **Import errors:** {len(dagbag.import_errors)}\n")
+          print("| DAG ID | Schedule | Tasks | Tags | Catchup |")
+          print("|--------|----------|------:|------|---------|")
+          for dag_id, dag in dags:
+              schedule = str(getattr(dag, 'schedule_interval', None) or dag.timetable)
+              tasks   = len(dag.tasks)
+              tags    = ", ".join(dag.tags) if dag.tags else "—"
+              catchup = "⚠️ Yes" if dag.catchup else "No"
+              print(f"| `{dag_id}` | `{schedule}` | {tasks} | {tags} | {catchup} |")
+          PYEOF
+          echo "Inventory generated"
+
+      - name: Post DAG inventory to PR
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/dag_inventory.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 4 — Unit Tests
+  # ═══════════════════════════════════════════════════════════════════════════════
+  unit-tests:
+    name: "Unit Tests"
+    runs-on: ubuntu-latest
+    needs: [validate-dags]
+    env:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////tmp/airflow_test.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache Airflow installation
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        id: airflow-cache
+        with:
+          path: ~/.local/lib/python${{ env.PYTHON_VERSION }}/site-packages
+          key: airflow-${{ env.AIRFLOW_VERSION }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        if: steps.airflow-cache.outputs.cache-hit != 'true'
+        run: |
+          pip install --upgrade pip --quiet
+          CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${{ env.AIRFLOW_VERSION }}/constraints-${{ env.PYTHON_VERSION }}.txt"
+          pip install "apache-airflow==${{ env.AIRFLOW_VERSION }}" \
+            pytest pytest-cov pytest-mock \
+            --constraint "$CONSTRAINT_URL" --quiet
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt --constraint "$CONSTRAINT_URL" --quiet
+          fi
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            --cov=dags \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70 \
+            --junit-xml=junit.xml \
+            --tb=short \
+            -v
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@54bcd8715eee62d40e33596ef5e8f0f48dbbccab # v4.1.0
+        if: always()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f5 # v4.3.1
+        if: always()
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            junit.xml
+            coverage.xml
+          retention-days: 14
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # FINAL GATE — All jobs must pass before merge is allowed
+  # ═══════════════════════════════════════════════════════════════════════════════
+  ci-gate:
+    name: "CI Gate (all checks passed)"
+    runs-on: ubuntu-latest
+    needs: [lint, security, validate-dags, unit-tests]
+    if: always()
+    steps:
+      - name: Evaluate all job results
+        run: |
+          LINT="${{ needs.lint.result }}"
+          SECURITY="${{ needs.security.result }}"
+          VALIDATE="${{ needs.validate-dags.result }}"
+          TESTS="${{ needs.unit-tests.result }}"
+
+          echo "lint:          $LINT"
+          echo "security:      $SECURITY"
+          echo "validate-dags: $VALIDATE"
+          echo "unit-tests:    $TESTS"
+
+          for RESULT in "$LINT" "$SECURITY" "$VALIDATE" "$TESTS"; do
+            if [ "$RESULT" != "success" ]; then
+              echo "::error::One or more CI checks failed — merge blocked"
+              exit 1
+            fi
+          done
+
+          echo "✅ All CI checks passed — safe to merge"

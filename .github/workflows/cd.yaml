@@ -1,0 +1,470 @@
+name: "DAG CD — Staging → Production"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dags/**"
+      - "requirements.txt"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+      skip_staging:
+        description: "Skip staging (emergency prod deploy — requires approval)"
+        required: false
+        type: boolean
+        default: false
+
+# ── Permissions ─────────────────────────────────────────────────────────────────
+# id-token:write is REQUIRED for OIDC — no long-lived AWS credentials stored
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+# Never cancel an in-flight production deployment
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  AIRFLOW_VERSION: "2.9.3"
+  AWS_REGION: "us-east-1"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 1 — Pre-deploy validation (fast gate, no AWS needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+jobs:
+  pre-deploy:
+    name: "Pre-Deploy Validation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      dag_files: ${{ steps.count.outputs.dag_files }}
+      changed_dags: ${{ steps.changed.outputs.files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 2
+
+      - name: Python syntax check — fail fast
+        run: python -m compileall dags/ -q
+
+      - name: Count DAG files
+        id: count
+        run: |
+          COUNT=$(find dags/ -name "*.py" -not -name "__init__.py" | wc -l | tr -d ' ')
+          echo "dag_files=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Total DAG files to deploy: $COUNT"
+
+      - name: Detect changed DAGs
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'dags/*.py' | tr '\n' ',' | sed 's/,$//')
+          echo "files=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "Changed DAGs: $CHANGED"
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Deploy to Staging
+  # ═══════════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: "Deploy → Staging"
+    runs-on: ubuntu-latest
+    needs: [pre-deploy]
+    if: ${{ !inputs.skip_staging || inputs.environment == 'staging' }}
+    environment:
+      name: staging
+      url: https://${{ secrets.STAGING_AIRFLOW_HOST }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      snapshot_key: ${{ steps.snapshot.outputs.key }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # ── AWS auth via OIDC (no static creds) ────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Scoped session name aids CloudTrail audit trail
+          role-session-name: GHA-DAGDeploy-Staging-${{ github.run_id }}
+          # Credentials expire after 1 hour — short-lived by design
+          role-duration-seconds: 3600
+
+      - name: Verify assumed identity
+        run: aws sts get-caller-identity
+
+      # ── Pre-deployment snapshot (enables fast rollback) ─────────────────────
+      - name: Snapshot current staging DAGs
+        id: snapshot
+        run: |
+          BUCKET="${{ secrets.STAGING_DAG_BUCKET }}"
+          KEY="dag-snapshots/staging/pre-$(date +%Y%m%dT%H%M%S)-${{ github.sha }}"
+          
+          aws s3 sync "s3://$BUCKET/dags/" "s3://$BUCKET/$KEY/" \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}" \
+            --quiet || echo "No existing DAGs to snapshot (first deploy)"
+          
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "📸 Snapshot: s3://$BUCKET/$KEY"
+
+      # ── Sync DAGs to S3 (KMS-encrypted, versioned bucket) ──────────────────
+      - name: Sync DAGs → Staging S3
+        run: |
+          BUCKET="${{ secrets.STAGING_DAG_BUCKET }}"
+
+          aws s3 sync dags/ "s3://$BUCKET/dags/" \
+            --delete \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc" \
+            --exclude "*.egg-info/*" \
+            --exclude ".DS_Store" \
+            --exclude "*.swp" \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}" \
+            --metadata "git-commit=${{ github.sha }},run-id=${{ github.run_id }},actor=${{ github.actor }}" \
+            --no-progress
+          
+          echo "✅ Synced ${{ needs.pre-deploy.outputs.dag_files }} DAG files to s3://$BUCKET/dags/"
+
+      # ── Force ECS Scheduler restart to pick up new DAGs immediately ────────
+      - name: Force ECS Scheduler new deployment
+        run: |
+          aws ecs update-service \
+            --cluster "${{ secrets.STAGING_ECS_CLUSTER }}" \
+            --service "${{ secrets.STAGING_SCHEDULER_SERVICE }}" \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}" \
+            --output text \
+            --query 'service.serviceArn'
+
+      - name: Wait for ECS Scheduler to stabilize
+        run: |
+          echo "⏳ Waiting for scheduler to stabilize (max 10 min)..."
+          aws ecs wait services-stable \
+            --cluster "${{ secrets.STAGING_ECS_CLUSTER }}" \
+            --services "${{ secrets.STAGING_SCHEDULER_SERVICE }}" \
+            --region "${{ env.AWS_REGION }}"
+          echo "✅ Scheduler stable"
+
+      # ── Smoke test via Airflow REST API ─────────────────────────────────────
+      - name: Smoke test — Airflow REST API
+        run: |
+          # Allow Airflow scheduler to parse new DAGs (one full heartbeat)
+          echo "⏳ Waiting 45s for DAG parser heartbeat..."
+          sleep 45
+          
+          BASE_URL="https://${{ secrets.STAGING_AIRFLOW_HOST }}/api/v1"
+          AUTH_HEADER="Authorization: Basic ${{ secrets.STAGING_AIRFLOW_BASIC_AUTH }}"
+          
+          # ── Check DAGs loaded ───────────────────────────────────────────────
+          HTTP_STATUS=$(curl -sf -o /tmp/dags_response.json \
+            -w "%{http_code}" \
+            -H "$AUTH_HEADER" \
+            "$BASE_URL/dags?limit=200")
+          
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Airflow API returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          
+          LOADED=$(python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/dags_response.json'))
+          print(d.get('total_entries', 0))
+          ")
+          
+          # ── Check import errors ─────────────────────────────────────────────
+          curl -sf \
+            -H "$AUTH_HEADER" \
+            "$BASE_URL/importErrors" \
+            -o /tmp/import_errors.json
+          
+          ERROR_COUNT=$(python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/import_errors.json'))
+          print(d.get('total_entries', 0))
+          ")
+          
+          echo "DAGs loaded: $LOADED | Import errors: $ERROR_COUNT"
+          
+          if [ "$ERROR_COUNT" -gt 0 ]; then
+            echo "::error::DAG import errors detected in staging!"
+            python3 -m json.tool /tmp/import_errors.json
+            exit 1
+          fi
+          
+          echo "✅ Staging smoke test passed — $LOADED DAGs, 0 import errors"
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Deploy to Production (requires manual approval via GitHub Environment)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  deploy-production:
+    name: "Deploy → Production"
+    runs-on: ubuntu-latest
+    needs: [pre-deploy, deploy-staging]
+    # Skip if this is a staging-only dispatch
+    if: ${{ !failure() && !cancelled() && inputs.environment != 'staging' }}
+    environment:
+      # ⚠️  Configure "production" environment in GitHub Settings:
+      #     Settings → Environments → production → Required reviewers
+      #     This creates a mandatory human approval gate before execution
+      name: production
+      url: https://${{ secrets.PROD_AIRFLOW_HOST }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # ── AWS auth via OIDC ───────────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GHA-DAGDeploy-Prod-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Verify assumed identity
+        run: aws sts get-caller-identity
+
+      # ── Distributed deploy lock (prevents concurrent production deploys) ────
+      - name: Acquire deployment lock
+        id: lock
+        run: |
+          LOCK_BUCKET="${{ secrets.PROD_STATE_BUCKET }}"
+          LOCK_KEY="locks/dag-deploy.lock"
+          LOCK_BODY="{\"run_id\":\"${{ github.run_id }}\",\"sha\":\"${{ github.sha }}\",\"actor\":\"${{ github.actor }}\",\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+          
+          # Conditional put: only write if object doesn't exist
+          # This prevents two concurrent jobs from both thinking they hold the lock
+          if aws s3api head-object --bucket "$LOCK_BUCKET" --key "$LOCK_KEY" 2>/dev/null; then
+            EXISTING=$(aws s3 cp "s3://$LOCK_BUCKET/$LOCK_KEY" - 2>/dev/null || echo '{}')
+            echo "::error::Another deployment is in progress: $EXISTING"
+            exit 1
+          fi
+          
+          echo "$LOCK_BODY" | aws s3 cp - "s3://$LOCK_BUCKET/$LOCK_KEY" \
+            --content-type application/json \
+            --sse aws:kms
+          
+          echo "🔒 Deployment lock acquired"
+
+      # ── Pre-deployment snapshot ─────────────────────────────────────────────
+      - name: Snapshot current production DAGs (rollback target)
+        id: snapshot
+        run: |
+          BUCKET="${{ secrets.PROD_DAG_BUCKET }}"
+          KEY="dag-snapshots/prod/pre-$(date +%Y%m%dT%H%M%S)-${{ github.sha }}"
+          
+          aws s3 sync "s3://$BUCKET/dags/" "s3://$BUCKET/$KEY/" \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}" \
+            --quiet || echo "No existing DAGs to snapshot (first deploy)"
+          
+          echo "SNAPSHOT_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "📸 Rollback target: s3://$BUCKET/$KEY"
+
+      # ── Sync DAGs to Production S3 ──────────────────────────────────────────
+      - name: Sync DAGs → Production S3
+        run: |
+          BUCKET="${{ secrets.PROD_DAG_BUCKET }}"
+          
+          aws s3 sync dags/ "s3://$BUCKET/dags/" \
+            --delete \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc" \
+            --exclude "*.egg-info/*" \
+            --exclude ".DS_Store" \
+            --exclude "*.swp" \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}" \
+            --metadata "git-commit=${{ github.sha }},run-id=${{ github.run_id }},actor=${{ github.actor }}" \
+            --no-progress
+          
+          echo "✅ Synced ${{ needs.pre-deploy.outputs.dag_files }} DAG files to s3://$BUCKET/dags/"
+
+      # ── Rolling ECS Scheduler restart ───────────────────────────────────────
+      - name: Force ECS Scheduler new deployment (rolling)
+        run: |
+          aws ecs update-service \
+            --cluster "${{ secrets.PROD_ECS_CLUSTER }}" \
+            --service "${{ secrets.PROD_SCHEDULER_SERVICE }}" \
+            --force-new-deployment \
+            --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200" \
+            --region "${{ env.AWS_REGION }}" \
+            --output text \
+            --query 'service.serviceArn'
+
+      - name: Wait for ECS Scheduler to stabilize
+        run: |
+          echo "⏳ Waiting for production scheduler to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${{ secrets.PROD_ECS_CLUSTER }}" \
+            --services "${{ secrets.PROD_SCHEDULER_SERVICE }}" \
+            --region "${{ env.AWS_REGION }}"
+          echo "✅ Scheduler stable"
+
+      # ── Production smoke test with auto-rollback ────────────────────────────
+      - name: Production smoke test (with auto-rollback on failure)
+        id: smoke-test
+        run: |
+          sleep 45
+          
+          BASE_URL="https://${{ secrets.PROD_AIRFLOW_HOST }}/api/v1"
+          AUTH_HEADER="Authorization: Basic ${{ secrets.PROD_AIRFLOW_BASIC_AUTH }}"
+          
+          curl -sf \
+            -H "$AUTH_HEADER" \
+            "$BASE_URL/importErrors" \
+            -o /tmp/prod_import_errors.json
+          
+          ERROR_COUNT=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/prod_import_errors.json'))
+          print(d.get('total_entries', 0))
+          ")
+          
+          if [ "$ERROR_COUNT" -gt 0 ]; then
+            echo "::error::Import errors in production — triggering auto-rollback!"
+            python3 -m json.tool /tmp/prod_import_errors.json
+            echo "ROLLBACK_REQUIRED=true" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          
+          echo "✅ Production smoke test passed — 0 import errors"
+
+      # ── Auto-rollback on smoke test failure ─────────────────────────────────
+      - name: Auto-rollback (smoke test failed)
+        if: env.ROLLBACK_REQUIRED == 'true'
+        run: |
+          BUCKET="${{ secrets.PROD_DAG_BUCKET }}"
+          echo "⏪ Rolling back to snapshot: s3://$BUCKET/$SNAPSHOT_KEY"
+          
+          aws s3 sync "s3://$BUCKET/$SNAPSHOT_KEY/" "s3://$BUCKET/dags/" \
+            --delete \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}"
+          
+          aws ecs update-service \
+            --cluster "${{ secrets.PROD_ECS_CLUSTER }}" \
+            --service "${{ secrets.PROD_SCHEDULER_SERVICE }}" \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}" \
+            --output text \
+            --query 'service.serviceArn'
+          
+          echo "⏪ Rollback initiated. Previous DAGs restored."
+
+      # ── Always release the lock ─────────────────────────────────────────────
+      - name: Release deployment lock
+        if: always()
+        run: |
+          aws s3 rm "s3://${{ secrets.PROD_STATE_BUCKET }}/locks/dag-deploy.lock" || true
+          echo "🔓 Deployment lock released"
+
+      # ── Notify Slack on success ─────────────────────────────────────────────
+      - name: Notify Slack — Success
+        if: success()
+        run: |
+          curl -sf -X POST \
+            -H "Content-type: application/json" \
+            --data "{
+              \"text\": \"✅ *DAG Production Deploy Succeeded*\",
+              \"attachments\": [{
+                \"color\": \"good\",
+                \"fields\": [
+                  {\"title\": \"Commit\", \"value\": \"<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\", \"short\": true},
+                  {\"title\": \"Actor\", \"value\": \"${{ github.actor }}\", \"short\": true},
+                  {\"title\": \"DAGs deployed\", \"value\": \"${{ needs.pre-deploy.outputs.dag_files }}\", \"short\": true},
+                  {\"title\": \"Changed\", \"value\": \"${{ needs.pre-deploy.outputs.changed_dags }}\", \"short\": false}
+                ]
+              }]
+            }" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Slack notify failed (non-blocking)"
+
+      # ── Notify Slack on failure ─────────────────────────────────────────────
+      - name: Notify Slack — Failure
+        if: failure()
+        run: |
+          curl -sf -X POST \
+            -H "Content-type: application/json" \
+            --data "{
+              \"text\": \"🚨 *DAG Production Deploy FAILED* — rollback initiated\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Commit\", \"value\": \"<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\", \"short\": true},
+                  {\"title\": \"Actor\", \"value\": \"${{ github.actor }}\", \"short\": true},
+                  {\"title\": \"Run\", \"value\": \"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>\", \"short\": true}
+                ]
+              }]
+            }" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}" || echo "Slack notify failed (non-blocking)"
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # JOB 4 — Manual Rollback (workflow_dispatch only)
+  # ═══════════════════════════════════════════════════════════════════════════════
+  rollback:
+    name: "Manual Rollback"
+    runs-on: ubuntu-latest
+    if: false  # Enable via: workflow_dispatch with rollback input — adjust condition as needed
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GHA-DAGRollback-${{ github.run_id }}
+
+      - name: List available snapshots
+        run: |
+          echo "Available rollback snapshots:"
+          aws s3 ls "s3://${{ secrets.PROD_DAG_BUCKET }}/dag-snapshots/prod/" \
+            --recursive \
+            --human-readable \
+            | sort -r | head -20
+
+      - name: Rollback to specified snapshot
+        run: |
+          # Set ROLLBACK_SNAPSHOT_KEY as a repo variable or pass via dispatch input
+          SNAPSHOT="${{ vars.ROLLBACK_SNAPSHOT_KEY }}"
+          BUCKET="${{ secrets.PROD_DAG_BUCKET }}"
+          
+          echo "⏪ Rolling back to: s3://$BUCKET/$SNAPSHOT"
+          
+          aws s3 sync "s3://$BUCKET/$SNAPSHOT/" "s3://$BUCKET/dags/" \
+            --delete \
+            --sse aws:kms \
+            --sse-kms-key-id "${{ secrets.DAG_KMS_KEY_ARN }}"
+          
+          aws ecs update-service \
+            --cluster "${{ secrets.PROD_ECS_CLUSTER }}" \
+            --service "${{ secrets.PROD_SCHEDULER_SERVICE }}" \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}" \
+            --output text \
+            --query 'service.serviceArn'
+          
+          echo "✅ Rollback complete"
