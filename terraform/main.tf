@@ -32,7 +32,7 @@ locals {
     { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
     { name = "AIRFLOW__CORE__FERNET_KEY", value = local.fernet_key },
     { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-    { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
+    { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/dags/" },
     { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" },
     { name = "AIRFLOW_HOME", value = "/opt/airflow" },
     { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
@@ -87,8 +87,8 @@ module "vpc" {
   single_nat_gateway      = false
   one_nat_gateway_per_az  = true
   tags = {
-    Name = "vpc"
-    Project = "ha-airflow"
+    Name      = "vpc"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -109,8 +109,8 @@ module "airflow_scheduler_sg" {
     }
   ]
   tags = {
-    Name = "airflow-scheduler-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-scheduler-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -130,8 +130,8 @@ module "airflow_worker_sg" {
     }
   ]
   tags = {
-    Name = "airflow-worker-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-worker-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -168,8 +168,8 @@ module "airflow_webserver_lb_sg" {
     }
   ]
   tags = {
-    Name = "airflow-webserver-lb-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-webserver-lb-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -198,8 +198,8 @@ module "airflow_webserver_sg" {
     }
   ]
   tags = {
-    Name = "airflow-webserver-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-webserver-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -224,8 +224,8 @@ module "airflow_rds_sg" {
   ]
   egress_rules = []
   tags = {
-    Name = "airflow-rds-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-rds-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -250,8 +250,8 @@ module "airflow_redis_sg" {
   ]
   egress_rules = []
   tags = {
-    Name = "airflow-redis-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-redis-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -285,8 +285,8 @@ module "efs_sg" {
     }
   ]
   tags = {
-    Name = "airflow-efs-sg"
-    Project = "ha-airflow"
+    Name      = "airflow-efs-sg"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -304,8 +304,8 @@ module "metadata_db_credentials" {
     password = tostring(data.vault_generic_secret.rds.data["password"])
   })
   tags = {
-    Name = "metadata-db-rds-secrets-${random_id.id.hex}"
-    Project = "ha-airflow"
+    Name      = "metadata-db-rds-secrets-${random_id.id.hex}"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -339,8 +339,27 @@ module "airflow_logs_bucket" {
     lambda_function = []
   }
   tags = {
-    Name = "airflow-logs-bucket-${random_id.id.hex}"
-    Project = "ha-airflow"
+    Name      = "airflow-logs-bucket-${random_id.id.hex}"
+    Project   = "ha-airflow"
+    ManagedBy = "terraform"
+  }
+}
+
+module "airflow_dags_bucket" {
+  source             = "./modules/s3"
+  bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
+  objects            = []
+  versioning_enabled = "Enabled"
+  cors               = []
+  bucket_policy      = ""
+  force_destroy      = true
+  bucket_notification = {
+    queue           = []
+    lambda_function = []
+  }
+  tags = {
+    Name      = "airflow-dags-bucket-${random_id.id.hex}"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -402,8 +421,8 @@ module "airflow_webserver_lb_logs" {
     lambda_function = []
   }
   tags = {
-    Name = "airflow-webserver-lb-logs-${random_id.id.hex}"
-    Project = "ha-airflow"
+    Name      = "airflow-webserver-lb-logs-${random_id.id.hex}"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -421,8 +440,8 @@ module "alarm_notifications" {
     }
   ]
   tags = {
-    Name = "ha-airflow-cloudwatch-alarm-notification-topic"
-    Project = "ha-airflow"
+    Name      = "ha-airflow-cloudwatch-alarm-notification-topic"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -482,9 +501,9 @@ module "efs_backup_role" {
         ]
     }
     EOF
-    tags = {
-    Name = "efs-backup-role"
-    Project = "ha-airflow"
+  tags = {
+    Name      = "efs-backup-role"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -641,8 +660,8 @@ module "airflow_dags_efs" {
   # replication_destination_region  = "us-west-2"
 
   tags = {
-    Name = "airflow-dags-efs"
-    Project = "ha-airflow"
+    Name      = "airflow-dags-efs"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -722,8 +741,8 @@ module "airflow_metadata_db" {
     # }
   ]
   tags = {
-    Name = "airflow"
-    Project = "ha-airflow"
+    Name      = "airflow"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -772,8 +791,8 @@ module "airflow_redis_cache" {
   port                       = 6379
   automatic_failover_enabled = true
   tags = {
-    Name = "airflow-redis"
-    Project = "ha-airflow"
+    Name      = "airflow-redis"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -832,8 +851,8 @@ module "webserver_lb" {
     }
   }
   tags = {
-    Name = "airflow-webserver-lb"
-    Project = "ha-airflow"
+    Name      = "airflow-webserver-lb"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
   depends_on = [
@@ -903,9 +922,9 @@ module "airflow_webserver_task_execution_role" {
         ]
     }
     EOF
-    tags = {
-    Name = "airflow-webserver-task-execution-role"
-    Project = "ha-airflow"
+  tags = {
+    Name      = "airflow-webserver-task-execution-role"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -967,9 +986,9 @@ module "airflow_scheduler_task_execution_role" {
         ]
     }
     EOF
-    tags = {
-    Name = "airflow-scheduler-task-execution-role"
-    Project = "ha-airflow"
+  tags = {
+    Name      = "airflow-scheduler-task-execution-role"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -1031,9 +1050,9 @@ module "airflow_worker_task_execution_role" {
         ]
     }
     EOF
-    tags = {
-    Name = "airflow-worker-task-execution-role"
-    Project = "ha-airflow"
+  tags = {
+    Name      = "airflow-worker-task-execution-role"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -1113,8 +1132,8 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
     }
   ])
   tags = {
-    Name = "airflow-db-init"
-    Project = "ha-airflow"
+    Name      = "airflow-db-init"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -1165,8 +1184,8 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
     }
   ])
   tags = {
-    Name = "airflow-create-user"
-    Project = "ha-airflow"
+    Name      = "airflow-create-user"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
@@ -1604,8 +1623,8 @@ module "ha_airflow_ecs_cluster" {
     }
   }
   tags = {
-    Name = "ha-airflow-ecs-cluster"
-    Project = "ha-airflow"
+    Name      = "ha-airflow-ecs-cluster"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
   depends_on = [
@@ -1937,13 +1956,13 @@ module "waf" {
   # Alarm Thresholds — tune after observing normal traffic
   # ---------------------------------------------------
 
-  alarm_blocked_requests_threshold = 500   # > 500 total blocks in 5 min = alert
-  alarm_rate_limit_threshold       = 100   # > 100 rate-limit hits in 5 min = alert
-  alarm_auth_rate_limit_threshold  = 20    # > 20 auth blocks in 5 min = alert
+  alarm_blocked_requests_threshold = 500 # > 500 total blocks in 5 min = alert
+  alarm_rate_limit_threshold       = 100 # > 100 rate-limit hits in 5 min = alert
+  alarm_auth_rate_limit_threshold  = 20  # > 20 auth blocks in 5 min = alert
 
   tags = {
-    Name = "airflow-lb-webserver-waf"
-    Project = "ha-airflow"
+    Name      = "airflow-lb-webserver-waf"
+    Project   = "ha-airflow"
     ManagedBy = "terraform"
   }
 }
