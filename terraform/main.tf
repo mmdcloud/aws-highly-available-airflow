@@ -32,7 +32,7 @@ locals {
     { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
     { name = "AIRFLOW__CORE__FERNET_KEY", value = local.fernet_key },
     { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "False" },
-    { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "s3://${module.airflow_dags_bucket.bucket}/dags/" },
+    { name = "AIRFLOW__CORE__DAGS_FOLDER", value = "/opt/airflow/dags" },
     { name = "AIRFLOW__CORE__DONOT_MODIFY_HANDLERS", value = "True" },
     { name = "AIRFLOW_HOME", value = "/opt/airflow" },
     { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = local.database_conn },
@@ -345,24 +345,24 @@ module "airflow_logs_bucket" {
   }
 }
 
-module "airflow_dags_bucket" {
-  source             = "./modules/s3"
-  bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
-  objects            = []
-  versioning_enabled = "Enabled"
-  cors               = []
-  bucket_policy      = ""
-  force_destroy      = true
-  bucket_notification = {
-    queue           = []
-    lambda_function = []
-  }
-  tags = {
-    Name      = "airflow-dags-bucket-${random_id.id.hex}"
-    Project   = "ha-airflow"
-    ManagedBy = "terraform"
-  }
-}
+# module "airflow_dags_bucket" {
+#   source             = "./modules/s3"
+#   bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
+#   objects            = []
+#   versioning_enabled = "Enabled"
+#   cors               = []
+#   bucket_policy      = ""
+#   force_destroy      = true
+#   bucket_notification = {
+#     queue           = []
+#     lambda_function = []
+#   }
+#   tags = {
+#     Name      = "airflow-dags-bucket-${random_id.id.hex}"
+#     Project   = "ha-airflow"
+#     ManagedBy = "terraform"
+#   }
+# }
 
 module "airflow_webserver_lb_logs" {
   source             = "./modules/s3"
@@ -977,6 +977,16 @@ module "airflow_scheduler_task_execution_role" {
             {
               "Effect": "Allow",
               "Action": [
+                "ssmmessages:CreateControlChannel",
+                "ssmmessages:CreateDataChannel",
+                "ssmmessages:OpenControlChannel",
+                "ssmmessages:OpenDataChannel"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "elasticfilesystem:ClientMount",
                 "elasticfilesystem:ClientWrite",
                 "elasticfilesystem:DescribeMountTargets"
@@ -1350,6 +1360,7 @@ module "ha_airflow_ecs_cluster" {
       desired_count          = 1 # IMPORTANT: Only run 1 scheduler at a time
       launch_type            = "FARGATE"
       assign_public_ip       = false
+      enable_execute_command = true
       deployment_controller = {
         type = "ECS"
       }
