@@ -345,24 +345,24 @@ module "airflow_logs_bucket" {
   }
 }
 
-# module "airflow_dags_bucket" {
-#   source             = "./modules/s3"
-#   bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
-#   objects            = []
-#   versioning_enabled = "Enabled"
-#   cors               = []
-#   bucket_policy      = ""
-#   force_destroy      = true
-#   bucket_notification = {
-#     queue           = []
-#     lambda_function = []
-#   }
-#   tags = {
-#     Name      = "airflow-dags-bucket-${random_id.id.hex}"
-#     Project   = "ha-airflow"
-#     ManagedBy = "terraform"
-#   }
-# }
+module "airflow_dags_bucket" {
+  source             = "./modules/s3"
+  bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
+  objects            = []
+  versioning_enabled = "Enabled"
+  cors               = []
+  bucket_policy      = ""
+  force_destroy      = true
+  bucket_notification = {
+    queue           = []
+    lambda_function = []
+  }
+  tags = {
+    Name      = "airflow-dags-bucket-${random_id.id.hex}"
+    Project   = "ha-airflow"
+    ManagedBy = "terraform"
+  }
+}
 
 module "airflow_webserver_lb_logs" {
   source             = "./modules/s3"
@@ -905,6 +905,17 @@ module "airflow_webserver_task_execution_role" {
             {
               "Effect": "Allow",
               "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                "${module.airflow_dags_bucket.arn}",
+                "${module.airflow_dags_bucket.arn}/*"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "secretsmanager:GetSecretValue",
                 "secretsmanager:DescribeSecret"
               ],
@@ -914,10 +925,14 @@ module "airflow_webserver_task_execution_role" {
               "Effect": "Allow",
               "Action": [
                 "elasticfilesystem:ClientMount",
-                "elasticfilesystem:ClientWrite",
-                "elasticfilesystem:DescribeMountTargets"
+                "elasticfilesystem:ClientWrite"
               ],
-              "Resource": "${module.airflow_dags_efs.arn}"
+              "Resource": [
+                "${module.airflow_dags_efs.arn}",
+                "${module.airflow_dags_efs.access_point_arns["dags"]}",
+                "${module.airflow_dags_efs.access_point_arns["plugins"]}",
+                "${module.airflow_dags_efs.access_point_arns["logs"]}"
+              ]
             }
         ]
     }
@@ -969,6 +984,17 @@ module "airflow_scheduler_task_execution_role" {
             {
               "Effect": "Allow",
               "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                "${module.airflow_dags_bucket.arn}",
+                "${module.airflow_dags_bucket.arn}/*"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "secretsmanager:GetSecretValue",
                 "secretsmanager:DescribeSecret"
               ],
@@ -988,10 +1014,14 @@ module "airflow_scheduler_task_execution_role" {
               "Effect": "Allow",
               "Action": [
                 "elasticfilesystem:ClientMount",
-                "elasticfilesystem:ClientWrite",
-                "elasticfilesystem:DescribeMountTargets"
+                "elasticfilesystem:ClientWrite"
               ],
-              "Resource": "${module.airflow_dags_efs.arn}"
+              "Resource": [
+                "${module.airflow_dags_efs.arn}",
+                "${module.airflow_dags_efs.access_point_arns["dags"]}",
+                "${module.airflow_dags_efs.access_point_arns["plugins"]}",
+                "${module.airflow_dags_efs.access_point_arns["logs"]}"
+              ]
             }
         ]
     }
@@ -1043,6 +1073,17 @@ module "airflow_worker_task_execution_role" {
             {
               "Effect": "Allow",
               "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                "${module.airflow_dags_bucket.arn}",
+                "${module.airflow_dags_bucket.arn}/*"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "secretsmanager:GetSecretValue",
                 "secretsmanager:DescribeSecret"
               ],
@@ -1052,10 +1093,14 @@ module "airflow_worker_task_execution_role" {
               "Effect": "Allow",
               "Action": [
                 "elasticfilesystem:ClientMount",
-                "elasticfilesystem:ClientWrite",
-                "elasticfilesystem:DescribeMountTargets"
+                "elasticfilesystem:ClientWrite"
               ],
-              "Resource": "${module.airflow_dags_efs.arn}"
+              "Resource": [
+                "${module.airflow_dags_efs.arn}",
+                "${module.airflow_dags_efs.access_point_arns["dags"]}",
+                "${module.airflow_dags_efs.access_point_arns["plugins"]}",
+                "${module.airflow_dags_efs.access_point_arns["logs"]}"
+              ]
             }
         ]
     }
@@ -1204,7 +1249,6 @@ module "ha_airflow_ecs_cluster" {
   source       = "terraform-aws-modules/ecs/aws"
   cluster_name = "ha-airflow-ecs-cluster"
   services = {
-
     webserver = {
       cpu                    = 2048
       memory                 = 4096
@@ -1353,8 +1397,8 @@ module "ha_airflow_ecs_cluster" {
     }
 
     scheduler = {
-      cpu                    = 2048
-      memory                 = 4096
+      cpu                    = 4096
+      memory                 = 8192
       task_exec_iam_role_arn = module.airflow_scheduler_task_execution_role.arn
       iam_role_arn           = module.airflow_scheduler_task_execution_role.arn
       desired_count          = 1 # IMPORTANT: Only run 1 scheduler at a time
@@ -1407,7 +1451,7 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         scheduler = {
-          cpu       = 2048 # Give scheduler more resources
+          cpu       = 2048
           memory    = 4096
           essential = true
           image     = "apache/airflow:2.10.4"
@@ -1509,6 +1553,26 @@ module "ha_airflow_ecs_cluster" {
             ignoredExitCodes     = []  # Don't ignore any exit codes
             restartAttemptPeriod = 300 # Wait 5 minutes before restarting
           }
+        },
+        s3_dag_sync = {
+          cpu       = 256
+          memory    = 512
+          essential = false
+          image     = "public.ecr.aws/aws-cli/aws-cli:2.22.0"
+          entryPoint = ["/bin/bash", "-c"]
+          command = [
+            "while true; do aws s3 sync s3://${module.airflow_dags_bucket.bucket}/dags/ /opt/airflow/dags/ --delete; sleep 30; done"
+          ]
+          mountPoints = [
+            {
+              sourceVolume  = "dags"
+              containerPath = "/opt/airflow/dags"
+              readOnly      = false
+            }
+          ]
+          environment = [
+            { name = "AWS_DEFAULT_REGION", value = var.region }
+          ]          
         }
       }
 
@@ -1625,7 +1689,7 @@ module "ha_airflow_ecs_cluster" {
             ignoredExitCodes     = [1]
             restartAttemptPeriod = 60
           }
-        }
+        }        
       }
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
