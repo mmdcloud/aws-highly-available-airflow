@@ -932,7 +932,10 @@ module "airflow_webserver_task_execution_role" {
                 "secretsmanager:GetSecretValue",
                 "secretsmanager:DescribeSecret"
               ],
-              "Resource": "${module.metadata_db_credentials.arn}"
+              "Resource": [
+                "${module.metadata_db_credentials.arn}",
+                "${module.airflow_admin_credentials.arn}"
+              ]
             },
             {
               "Effect": "Allow",
@@ -1011,7 +1014,10 @@ module "airflow_scheduler_task_execution_role" {
                 "secretsmanager:GetSecretValue",
                 "secretsmanager:DescribeSecret"
               ],
-              "Resource": "${module.metadata_db_credentials.arn}"
+              "Resource": [
+                "${module.metadata_db_credentials.arn}",
+                "${module.airflow_admin_credentials.arn}"
+              ]
             },
             {
               "Effect": "Allow",
