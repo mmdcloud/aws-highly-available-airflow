@@ -15,12 +15,25 @@ module "airflow_webserver_secret_key" {
   })
 }
 
+module "airflow_admin_credentials" {
+  source                  = "./modules/secrets-manager"
+  name                    = "airflow-admin-credentials-${random_id.id.hex}"
+  description             = "Airflow admin user credentials"
+  recovery_window_in_days = 7
+  secret_string = jsonencode({
+    username = "admin"
+    password = local.airflow_admin_pass
+    email    = var.airflow_admin_email
+  })
+}
+
 locals {
   rds_username       = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
   rds_password       = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
   redis_auth_token   = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
   fernet_key         = nonsensitive(tostring(data.vault_generic_secret.airflow.data["fernet_key"]))
   airflow_secret_key = nonsensitive(random_password.airflow_secret_key.result)
+  airflow_admin_pass  = nonsensitive(tostring(data.vault_generic_secret.airflow.data["admin_password"]))
   redis_endpoint     = module.airflow_redis_cache.primary_endpoint_address
 
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"

@@ -8,8 +8,20 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
+    vault = {
+      source  = "hashicorp/vault"
+      version = "~> 4.0"
+    }
   }
+  # backend "s3" {
+  #   bucket       = "haairflowtfstate"
+  #   key          = "prod/us-east-1/terraform.tfstate"
+  #   region       = "us-east-1"
+  #   use_lockfile = true
+  # }
 }
+
+provider "vault" {}
 
 # Configure the AWS Provider
 provider "aws" {

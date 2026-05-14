@@ -31,3 +31,9 @@ variable "domain_name" {
   type        = string
   description = "Domain name for the Airflow webserver"
 }
+
+variable "airflow_admin_email" {
+  type        = string
+  description = "Email address for the Airflow admin user"
+  default     = "admin@example.com"
+}
