@@ -33,7 +33,7 @@ locals {
   redis_auth_token   = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
   fernet_key         = nonsensitive(tostring(data.vault_generic_secret.airflow.data["fernet_key"]))
   airflow_secret_key = nonsensitive(random_password.airflow_secret_key.result)
-  airflow_admin_pass  = nonsensitive(tostring(data.vault_generic_secret.airflow.data["admin_password"]))
+  airflow_admin_pass = nonsensitive(tostring(data.vault_generic_secret.airflow.data["admin_password"]))
   redis_endpoint     = module.airflow_redis_cache.primary_endpoint_address
 
   database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
@@ -532,6 +532,15 @@ resource "aws_iam_role_policy_attachment" "efs_restore_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
 }
 
+resource "aws_backup_vault" "efs" {
+  name = "airflow-dags-efs-backup-vault"
+  tags = {
+    Name      = "airflow-dags-efs-backup-vault"
+    Project   = "ha-airflow"
+    ManagedBy = "terraform"
+  }
+}
+
 module "airflow_dags_efs" {
   source = "./modules/efs"
 
@@ -650,7 +659,7 @@ module "airflow_dags_efs" {
   # Backup Configuration
   enable_backup_policy      = true
   create_custom_backup_plan = true
-  backup_vault_name         = "Default"
+  backup_vault_name         = aws_backup_vault.efs.name
   backup_schedule           = "cron(0 2 * * ? *)" # Daily at 2 AM UTC
   backup_retention_days     = 120
   backup_cold_storage_after = null
@@ -1269,8 +1278,8 @@ module "ha_airflow_ecs_cluster" {
   cluster_name = "ha-airflow-ecs-cluster"
   services = {
     webserver = {
-      cpu                    = 2048
-      memory                 = 4096
+      cpu                    = 1024
+      memory                 = 2048
       task_exec_iam_role_arn = module.airflow_webserver_task_execution_role.arn
       iam_role_arn           = module.airflow_webserver_task_execution_role.arn
       desired_count          = 2
@@ -1416,8 +1425,8 @@ module "ha_airflow_ecs_cluster" {
     }
 
     scheduler = {
-      cpu                    = 4096
-      memory                 = 8192
+      cpu                    = 1024
+      memory                 = 2048
       task_exec_iam_role_arn = module.airflow_scheduler_task_execution_role.arn
       iam_role_arn           = module.airflow_scheduler_task_execution_role.arn
       desired_count          = 1 # IMPORTANT: Only run 1 scheduler at a time
@@ -1470,8 +1479,8 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         scheduler = {
-          cpu       = 2048
-          memory    = 4096
+          cpu       = 768
+          memory    = 1536
           essential = true
           image     = "apache/airflow:2.10.4"
           command   = ["scheduler"]
@@ -1574,10 +1583,10 @@ module "ha_airflow_ecs_cluster" {
           }
         },
         s3_dag_sync = {
-          cpu       = 256
-          memory    = 512
-          essential = false
-          image     = "public.ecr.aws/aws-cli/aws-cli:2.22.0"
+          cpu        = 256
+          memory     = 512
+          essential  = false
+          image      = "public.ecr.aws/aws-cli/aws-cli:2.22.0"
           entryPoint = ["/bin/bash", "-c"]
           command = [
             "while true; do aws s3 sync s3://${module.airflow_dags_bucket.bucket}/dags/ /opt/airflow/dags/ --delete; sleep 30; done"
@@ -1591,7 +1600,7 @@ module "ha_airflow_ecs_cluster" {
           ]
           environment = [
             { name = "AWS_DEFAULT_REGION", value = var.region }
-          ]          
+          ]
         }
       }
 
@@ -1602,8 +1611,8 @@ module "ha_airflow_ecs_cluster" {
     }
 
     worker = {
-      cpu                    = 2048
-      memory                 = 4096
+      cpu                    = 1024
+      memory                 = 2048
       task_exec_iam_role_arn = module.airflow_worker_task_execution_role.arn
       iam_role_arn           = module.airflow_worker_task_execution_role.arn
       desired_count          = 2
@@ -1708,7 +1717,7 @@ module "ha_airflow_ecs_cluster" {
             ignoredExitCodes     = [1]
             restartAttemptPeriod = 60
           }
-        }        
+        }
       }
       subnet_ids                    = module.vpc.private_subnets
       vpc_id                        = module.vpc.vpc_id
@@ -1737,24 +1746,30 @@ resource "null_resource" "airflow_db_init" {
 
   provisioner "local-exec" {
     command = <<-EOT
-    TASK_ARN=$(aws ecs run-task \
+        RAW_OUTPUT=$(aws ecs run-task \
       --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
-      --task-definition ${aws_ecs_task_definition.airflow_db_init.family} \
+      --task-definition ${aws_ecs_task_definition.airflow_db_init.arn} \
       --launch-type FARGATE \
       --region ${var.region} \
-      --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
-      --query 'tasks[0].taskArn' \
-      --output text)
+      --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}")
+
+    TASK_ARN=$(echo "$RAW_OUTPUT" | jq -r '.tasks[0].taskArn // empty')
+
+    if [ -z "$TASK_ARN" ]; then
+      echo "ERROR: Failed to run task. ECS Response:"
+      echo "$RAW_OUTPUT"
+      exit 1
+    fi
 
     echo "Waiting for db init task $TASK_ARN to complete..."
     aws ecs wait tasks-stopped \
       --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
-      --tasks $TASK_ARN \
+      --tasks "$TASK_ARN" \
       --region ${var.region}
 
     EXIT_CODE=$(aws ecs describe-tasks \
       --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
-      --tasks $TASK_ARN \
+      --tasks "$TASK_ARN" \
       --region ${var.region} \
       --query 'tasks[0].containers[0].exitCode' \
       --output text)
@@ -1783,7 +1798,7 @@ resource "null_resource" "airflow_create_user" {
     command = <<-EOT
       aws ecs run-task \
         --cluster ${module.ha_airflow_ecs_cluster.cluster_name} \
-        --task-definition ${aws_ecs_task_definition.airflow_create_user.family} \
+        --task-definition ${aws_ecs_task_definition.airflow_create_user.arn} \
         --launch-type FARGATE \
         --region ${var.region} \
         --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${module.airflow_scheduler_sg.id}],assignPublicIp=DISABLED}" \
@@ -1849,7 +1864,7 @@ module "airflow_scheduler_autoscaling_policy" {
   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["scheduler"].name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
-  policies = []
+  policies           = []
 }
 
 module "airflow_worker_autoscaling_policy" {
@@ -1991,81 +2006,81 @@ module "alb_unhealthy_targets" {
 # -----------------------------------------------------------------------------------------
 # WAF Configuration
 # -----------------------------------------------------------------------------------------
-module "waf" {
-  source = "./modules/waf"
+# module "waf" {
+#   source = "./modules/waf"
 
-  # Naming — matches your existing convention
-  name = "airflow-lb-webserver-waf"
+#   # Naming — matches your existing convention
+#   name = "airflow-lb-webserver-waf"
 
-  # Attach WAF to the public-facing Frontend ALB
-  # Replace with your actual frontend ALB ARN output
-  frontend_alb_arn = module.webserver_lb.arn
+#   # Attach WAF to the public-facing Frontend ALB
+#   # Replace with your actual frontend ALB ARN output
+#   frontend_alb_arn = module.webserver_lb.arn
 
-  # Reuse your existing SNS alarm topic — no new infra needed
-  alarm_topic_arn = module.alarm_notifications.arn
+#   # Reuse your existing SNS alarm topic — no new infra needed
+#   alarm_topic_arn = module.alarm_notifications.arn
 
-  # Account + region for log resource policy
-  account_id = data.aws_caller_identity.current.account_id
-  aws_region = var.region
+#   # Account + region for log resource policy
+#   account_id = data.aws_caller_identity.current.account_id
+#   aws_region = var.region
 
-  # ---------------------------------------------------
-  # IP Management
-  # ---------------------------------------------------
+#   # ---------------------------------------------------
+#   # IP Management
+#   # ---------------------------------------------------
 
-  # IPs to always block — add known attackers, threat intel here
-  blocked_ip_list = [
-    # "203.0.113.0/24",  # Example: known scanner range
-  ]
+#   # IPs to always block — add known attackers, threat intel here
+#   blocked_ip_list = [
+#     # "203.0.113.0/24",  # Example: known scanner range
+#   ]
 
-  # IPs that bypass rate limiting — office, CI/CD, trusted partners
-  allowed_ip_list = [
-    # "YOUR_OFFICE_IP/32",
-    # "YOUR_CICD_RUNNER_IP/32",
-  ]
+#   # IPs that bypass rate limiting — office, CI/CD, trusted partners
+#   allowed_ip_list = [
+#     # "YOUR_OFFICE_IP/32",
+#     # "YOUR_CICD_RUNNER_IP/32",
+#   ]
 
-  # ---------------------------------------------------
-  # Geo Blocking
-  # ---------------------------------------------------
+#   # ---------------------------------------------------
+#   # Geo Blocking
+#   # ---------------------------------------------------
 
-  # Block countries not in your target market
-  # Remove or leave empty [] if you serve global traffic
-  blocked_countries = [
-    # "KP",  # North Korea
-    # "IR",  # Iran
-    # "CU",  # Cuba
-    # "SY",  # Syria
-  ]
+#   # Block countries not in your target market
+#   # Remove or leave empty [] if you serve global traffic
+#   blocked_countries = [
+#     # "KP",  # North Korea
+#     # "IR",  # Iran
+#     # "CU",  # Cuba
+#     # "SY",  # Syria
+#   ]
 
-  # ---------------------------------------------------
-  # Rate Limiting
-  # ---------------------------------------------------
+#   # ---------------------------------------------------
+#   # Rate Limiting
+#   # ---------------------------------------------------
 
-  # General rate limit per IP per 5-minute window
-  # 2000 = ~6-7 requests/second — comfortable for real users, blocks bots
-  rate_limit_requests = 2000
+#   # General rate limit per IP per 5-minute window
+#   # 2000 = ~6-7 requests/second — comfortable for real users, blocks bots
+#   rate_limit_requests = 2000
 
-  # Auth endpoints get a much tighter limit
-  # 100 = ~1 login attempt every 3 seconds per IP
-  auth_rate_limit_requests = 100
+#   # Auth endpoints get a much tighter limit
+#   # 100 = ~1 login attempt every 3 seconds per IP
+#   auth_rate_limit_requests = 100
 
-  # ---------------------------------------------------
-  # Logging
-  # ---------------------------------------------------
+#   # ---------------------------------------------------
+#   # Logging
+#   # ---------------------------------------------------
 
-  # How long to keep WAF logs in CloudWatch
-  log_retention_days = 90
+#   # How long to keep WAF logs in CloudWatch
+#   log_retention_days = 90
 
-  # ---------------------------------------------------
-  # Alarm Thresholds — tune after observing normal traffic
-  # ---------------------------------------------------
+#   # ---------------------------------------------------
+#   # Alarm Thresholds — tune after observing normal traffic
+#   # ---------------------------------------------------
 
-  alarm_blocked_requests_threshold = 500 # > 500 total blocks in 5 min = alert
-  alarm_rate_limit_threshold       = 100 # > 100 rate-limit hits in 5 min = alert
-  alarm_auth_rate_limit_threshold  = 20  # > 20 auth blocks in 5 min = alert
+#   alarm_blocked_requests_threshold = 500 # > 500 total blocks in 5 min = alert
+#   alarm_rate_limit_threshold       = 100 # > 100 rate-limit hits in 5 min = alert
+#   alarm_auth_rate_limit_threshold  = 20  # > 20 auth blocks in 5 min = alert
 
-  tags = {
-    Name      = "airflow-lb-webserver-waf"
-    Project   = "ha-airflow"
-    ManagedBy = "terraform"
-  }
-}
+#   tags = {
+#     Name      = "airflow-lb-webserver-waf"
+#     Project   = "ha-airflow"
+#     ManagedBy = "terraform"
+#   }
+# }
