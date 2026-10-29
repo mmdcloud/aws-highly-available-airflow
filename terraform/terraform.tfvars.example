@@ -1,0 +1,87 @@
+# ==============================================================================
+# Production / Staging Example Variables Configuration
+# Copy this file to terraform.tfvars and customize for your environment
+# ==============================================================================
+
+# Project & Environment
+project_name = "ha-airflow"
+environment  = "prod" # Options: prod, stage, dev
+region       = "us-east-1"
+
+# Tags
+tags = {
+  Team        = "DataPlatform"
+  CostCenter  = "Analytics"
+  Environment = "prod"
+}
+
+# Networking
+vpc_cidr            = "10.0.0.0/16"
+azs                 = ["us-east-1a", "us-east-1b", "us-east-1c"]
+public_subnets      = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+private_subnets     = ["10.0.4.0/24", "10.0.5.0/24", "10.0.6.0/24"]
+database_subnets    = ["10.0.7.0/24", "10.0.8.0/24", "10.0.9.0/24"]
+elasticache_subnets = ["10.0.10.0/24", "10.0.11.0/24", "10.0.12.0/24"]
+single_nat_gateway  = false # Set to true for dev/staging to save NAT Gateway costs
+
+# Domain & Ingress
+domain_name         = "airflow.example.com"
+# certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/xxxx-xxxx-xxxx" # Optional ACM cert
+
+# Airflow Application
+airflow_image       = "apache/airflow:2.10.4"
+airflow_admin_email = "admin@example.com"
+alarm_email         = "alerts@example.com"
+dag_sync_interval   = 30
+
+# Vault Paths
+vault_secret_path_rds     = "secret/rds"
+vault_secret_path_airflow = "secret/airflow"
+vault_secret_path_redis   = "secret/redis"
+
+# ECS Compute Sizing
+# Sized to stay within 8 vCPU quota: Webserver (2x1) + Scheduler (1x1) + Worker (2x1) = 5 vCPUs
+webserver_cpu              = 1024
+webserver_memory           = 2048
+webserver_desired_count    = 2
+webserver_min_capacity     = 2
+webserver_max_capacity     = 10
+
+scheduler_cpu              = 1024
+scheduler_memory           = 2048
+scheduler_container_cpu    = 768
+scheduler_container_memory = 1536
+dag_sync_cpu               = 256
+dag_sync_memory            = 512
+scheduler_desired_count     = 1
+
+worker_cpu                 = 1024
+worker_memory              = 2048
+worker_desired_count       = 2
+worker_min_capacity        = 2
+worker_max_capacity        = 10
+worker_concurrency         = 16
+
+# RDS PostgreSQL Metadata DB
+db_name                    = "airflow"
+db_instance_class          = "db.r6g.large" # Use db.t4g.medium for dev
+db_allocated_storage       = 100
+db_max_allocated_storage   = 200
+db_storage_type            = "gp3"
+db_engine_version          = "17"
+db_multi_az                = true
+db_backup_retention_period = 30
+db_deletion_protection     = false          # Set to true for strict production
+
+# ElastiCache Redis
+redis_node_type            = "cache.t4g.micro" # Use cache.m6g.large for high throughput
+redis_num_cache_clusters   = 2
+redis_multi_az_enabled     = true
+redis_automatic_failover_enabled = true
+
+# Storage & Logging
+efs_performance_mode       = "generalPurpose"
+efs_throughput_mode        = "elastic"
+log_retention_in_days      = 30
+s3_force_destroy           = false # Protect production S3 buckets from accidental deletion
+

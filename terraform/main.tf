@@ -7,7 +7,7 @@ resource "random_password" "airflow_secret_key" {
 
 module "airflow_webserver_secret_key" {
   source                  = "./modules/secrets-manager"
-  name                    = "airflow-webserver-secret-key-${random_id.id.hex}"
+  name                    = "${local.name_prefix}-webserver-secret-key-${random_id.id.hex}"
   description             = "Secret key for Airflow webserver session management"
   recovery_window_in_days = 7
   secret_string = jsonencode({
@@ -17,7 +17,7 @@ module "airflow_webserver_secret_key" {
 
 module "airflow_admin_credentials" {
   source                  = "./modules/secrets-manager"
-  name                    = "airflow-admin-credentials-${random_id.id.hex}"
+  name                    = "${local.name_prefix}-admin-credentials-${random_id.id.hex}"
   description             = "Airflow admin user credentials"
   recovery_window_in_days = 7
   secret_string = jsonencode({
@@ -28,6 +28,13 @@ module "airflow_admin_credentials" {
 }
 
 locals {
+  name_prefix = "${var.project_name}-${var.environment}"
+  common_tags = merge(var.tags, {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  })
+
   rds_username       = nonsensitive(tostring(data.vault_generic_secret.rds.data["username"]))
   rds_password       = nonsensitive(tostring(data.vault_generic_secret.rds.data["password"]))
   redis_auth_token   = nonsensitive(tostring(data.vault_generic_secret.redis.data["auth_token"]))
@@ -36,9 +43,9 @@ locals {
   airflow_admin_pass = nonsensitive(tostring(data.vault_generic_secret.airflow.data["admin_password"]))
   redis_endpoint     = module.airflow_redis_cache.primary_endpoint_address
 
-  database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+  database_conn         = "postgresql+psycopg2://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/${var.db_name}"
   celery_broker_url     = "rediss://:${local.redis_auth_token}@${local.redis_endpoint}:6379/0"
-  celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/airflow"
+  celery_result_backend = "db+postgresql://${local.rds_username}:${local.rds_password}@${module.airflow_metadata_db.endpoint}/${var.db_name}"
 
   # Shared env vars every container needs — define once, reuse everywhere
   common_env = [
@@ -63,17 +70,17 @@ locals {
 # Data Sources
 # -----------------------------------------------------------------------------------------
 data "vault_generic_secret" "rds" {
-  path = "secret/rds"
+  path = var.vault_secret_path_rds
 }
 
 data "vault_generic_secret" "airflow" {
-  path = "secret/airflow"
+  path = var.vault_secret_path_airflow
 }
 
 data "aws_elb_service_account" "main" {}
 
 data "vault_generic_secret" "redis" {
-  path = "secret/redis"
+  path = var.vault_secret_path_redis
 }
 
 resource "random_id" "id" {
@@ -85,8 +92,8 @@ resource "random_id" "id" {
 # -----------------------------------------------------------------------------------------
 module "vpc" {
   source                  = "./modules/vpc"
-  vpc_name                = "vpc"
-  vpc_cidr                = "10.0.0.0/16"
+  vpc_name                = "${local.name_prefix}-vpc"
+  vpc_cidr                = var.vpc_cidr
   azs                     = var.azs
   public_subnets          = var.public_subnets
   private_subnets         = var.private_subnets
@@ -97,13 +104,11 @@ module "vpc" {
   create_igw              = true
   map_public_ip_on_launch = true
   enable_nat_gateway      = true
-  single_nat_gateway      = false
-  one_nat_gateway_per_az  = true
-  tags = {
-    Name      = "vpc"
-    Project   = "ha-airflow"
-    ManagedBy = "terraform"
-  }
+  single_nat_gateway      = var.single_nat_gateway
+  one_nat_gateway_per_az  = !var.single_nat_gateway
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-vpc"
+  })
 }
 
 # Security Group
@@ -123,7 +128,8 @@ module "airflow_scheduler_sg" {
   ]
   tags = {
     Name      = "airflow-scheduler-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -144,7 +150,8 @@ module "airflow_worker_sg" {
   ]
   tags = {
     Name      = "airflow-worker-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -182,7 +189,8 @@ module "airflow_webserver_lb_sg" {
   ]
   tags = {
     Name      = "airflow-webserver-lb-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -212,7 +220,8 @@ module "airflow_webserver_sg" {
   ]
   tags = {
     Name      = "airflow-webserver-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -238,7 +247,8 @@ module "airflow_rds_sg" {
   egress_rules = []
   tags = {
     Name      = "airflow-rds-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -264,7 +274,8 @@ module "airflow_redis_sg" {
   egress_rules = []
   tags = {
     Name      = "airflow-redis-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -299,7 +310,8 @@ module "efs_sg" {
   ]
   tags = {
     Name      = "airflow-efs-sg"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -318,7 +330,8 @@ module "metadata_db_credentials" {
   })
   tags = {
     Name      = "metadata-db-rds-secrets-${random_id.id.hex}"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -328,7 +341,7 @@ module "metadata_db_credentials" {
 # -----------------------------------------------------------------------------------------
 module "airflow_logs_bucket" {
   source             = "./modules/s3"
-  bucket_name        = "airflow-logs-bucket-${random_id.id.hex}"
+  bucket_name        = "${local.name_prefix}-logs-${random_id.id.hex}"
   objects            = []
   versioning_enabled = "Enabled"
   cors = [
@@ -346,21 +359,22 @@ module "airflow_logs_bucket" {
     }
   ]
   bucket_policy = ""
-  force_destroy = true
+  force_destroy = var.s3_force_destroy
   bucket_notification = {
     queue           = []
     lambda_function = []
   }
   tags = {
     Name      = "airflow-logs-bucket-${random_id.id.hex}"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
 
 module "airflow_dags_bucket" {
   source             = "./modules/s3"
-  bucket_name        = "airflow-dags-bucket-${random_id.id.hex}"
+  bucket_name        = "${local.name_prefix}-dags-${random_id.id.hex}"
   objects            = []
   versioning_enabled = "Enabled"
   cors               = []
@@ -372,14 +386,15 @@ module "airflow_dags_bucket" {
   }
   tags = {
     Name      = "airflow-dags-bucket-${random_id.id.hex}"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
 
 module "airflow_webserver_lb_logs" {
   source             = "./modules/s3"
-  bucket_name        = "airflow-webserver-lb-logs-${random_id.id.hex}"
+  bucket_name        = "${local.name_prefix}-webserver-lb-logs-${random_id.id.hex}"
   objects            = []
   versioning_enabled = "Enabled"
   cors = [
@@ -428,14 +443,15 @@ module "airflow_webserver_lb_logs" {
       }
     ]
   })
-  force_destroy = true
+  force_destroy = var.s3_force_destroy
   bucket_notification = {
     queue           = []
     lambda_function = []
   }
   tags = {
     Name      = "airflow-webserver-lb-logs-${random_id.id.hex}"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -445,18 +461,16 @@ module "airflow_webserver_lb_logs" {
 # -----------------------------------------------------------------------------------------
 module "alarm_notifications" {
   source     = "./modules/sns"
-  topic_name = "ha-airflow-cloudwatch-alarm-notification-topic"
+  topic_name = "${local.name_prefix}-alarm-notifications-topic"
   subscriptions = [
     {
       protocol = "email"
-      endpoint = "madmaxcloudonline@gmail.com"
+      endpoint = var.alarm_email
     }
   ]
-  tags = {
-    Name      = "ha-airflow-cloudwatch-alarm-notification-topic"
-    Project   = "ha-airflow"
-    ManagedBy = "terraform"
-  }
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-alarm-notifications-topic"
+  })
 }
 
 # -----------------------------------------------------------------------------------------
@@ -516,7 +530,8 @@ module "efs_backup_role" {
     EOF
   tags = {
     Name      = "efs-backup-role"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -533,19 +548,17 @@ resource "aws_iam_role_policy_attachment" "efs_restore_policy" {
 }
 
 resource "aws_backup_vault" "efs" {
-  name = "airflow-dags-efs-backup-vault"
-  tags = {
-    Name      = "airflow-dags-efs-backup-vault"
-    Project   = "ha-airflow"
-    ManagedBy = "terraform"
-  }
+  name = "${local.name_prefix}-efs-backup-vault"
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-efs-backup-vault"
+  })
 }
 
 module "airflow_dags_efs" {
   source = "./modules/efs"
 
-  name           = "airflow-dags-efs"
-  creation_token = "airflow-dags-${random_id.id.hex}"
+  name           = "${local.name_prefix}-dags-efs"
+  creation_token = "${local.name_prefix}-dags-${random_id.id.hex}"
 
   # Network Configuration
   subnet_ids          = module.vpc.private_subnets
@@ -556,13 +569,8 @@ module "airflow_dags_efs" {
   create_kms_key = true
 
   # Performance Configuration
-  # generalPurpose is suitable for most Airflow workloads
-  # Use maxIO only if you have hundreds of concurrent connections
-  performance_mode = "generalPurpose"
-
-  # Elastic throughput automatically scales with workload
-  # Recommended for variable workloads like Airflow
-  throughput_mode = "elastic"
+  performance_mode = var.efs_performance_mode
+  throughput_mode  = var.efs_throughput_mode
 
   # Lifecycle Management for Cost Optimization
   # Move infrequently accessed files to IA storage after 30 days
@@ -661,13 +669,13 @@ module "airflow_dags_efs" {
   create_custom_backup_plan = true
   backup_vault_name         = aws_backup_vault.efs.name
   backup_schedule           = "cron(0 2 * * ? *)" # Daily at 2 AM UTC
-  backup_retention_days     = 120
+  backup_retention_days     = var.efs_backup_retention_days
   backup_cold_storage_after = null
 
   # Weekly backups with longer retention
-  enable_weekly_backup             = true
+  enable_weekly_backup             = var.efs_enable_weekly_backup
   weekly_backup_schedule           = "cron(0 3 ? * SUN *)"
-  weekly_backup_retention_days     = 90
+  weekly_backup_retention_days     = var.efs_weekly_backup_retention_days
   weekly_backup_cold_storage_after = null
 
   # CloudWatch Alarms
@@ -683,7 +691,8 @@ module "airflow_dags_efs" {
 
   tags = {
     Name      = "airflow-dags-efs"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -713,37 +722,33 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
 
 module "airflow_metadata_db" {
   source                          = "./modules/rds"
-  db_name                         = "airflow"
-  allocated_storage               = 100
-  max_allocated_storage           = 200
-  storage_type                    = "gp3"
+  db_name                         = var.db_name
+  allocated_storage               = var.db_allocated_storage
+  max_allocated_storage           = var.db_max_allocated_storage
+  storage_type                    = var.db_storage_type
   engine                          = "postgres"
-  engine_version                  = "17"
-  instance_class                  = "db.r6g.large"
-  multi_az                        = true
+  engine_version                  = var.db_engine_version
+  instance_class                  = var.db_instance_class
+  multi_az                        = var.db_multi_az
   storage_encrypted               = true
-  username                        = tostring(data.vault_generic_secret.rds.data["username"])
-  password                        = tostring(data.vault_generic_secret.rds.data["password"])
-  subnet_group_name               = "airflow-metadata-db-subnet-group"
+  username                        = local.rds_username
+  password                        = local.rds_password
+  subnet_group_name               = "${local.name_prefix}-metadata-db-subnet-group"
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
-  backup_retention_period         = 30
-  backup_window                   = "04:00-06:00"
-  maintenance_window              = "Mon:00:00-Mon:03:00"
-  subnet_group_ids = [
-    module.vpc.database_subnets[0],
-    module.vpc.database_subnets[1],
-    module.vpc.database_subnets[2]
-  ]
-  vpc_security_group_ids                = [module.airflow_rds_sg.id]
-  publicly_accessible                   = false
-  deletion_protection                   = false
-  skip_final_snapshot                   = true
+  backup_retention_period         = var.db_backup_retention_period
+  backup_window                   = var.db_backup_window
+  maintenance_window              = var.db_maintenance_window
+  subnet_group_ids                = module.vpc.database_subnets
+  vpc_security_group_ids          = [module.airflow_rds_sg.id]
+  publicly_accessible             = false
+  deletion_protection             = var.db_deletion_protection
+  skip_final_snapshot             = var.db_skip_final_snapshot
   performance_insights_enabled          = true
   performance_insights_retention_period = 7
   monitoring_interval                   = 60
   monitoring_role_arn                   = aws_iam_role.rds_monitoring_role.arn
-  parameter_group_name                  = "airflow-metadata-db-pg"
-  parameter_group_family                = "postgres17"
+  parameter_group_name                  = "${local.name_prefix}-metadata-db-pg"
+  parameter_group_family                = var.db_parameter_group_family
   parameters = [
     # {
     #   name  = "max_connections"
@@ -764,7 +769,8 @@ module "airflow_metadata_db" {
   ]
   tags = {
     Name      = "airflow"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -774,25 +780,25 @@ module "airflow_metadata_db" {
 # -----------------------------------------------------------------------------------------
 module "redis_slow_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
-  log_group_name    = "/aws/elasticache/airflow-redis/slow-log"
-  retention_in_days = 7
+  log_group_name    = "/aws/elasticache/${local.name_prefix}-redis/slow-log"
+  retention_in_days = var.log_retention_in_days
 }
 
 module "airflow_redis_cache" {
   source                     = "./modules/elasticache"
   engine                     = "redis"
-  engine_version             = "7.0"
-  node_type                  = "cache.t4g.micro"
-  num_cache_clusters         = 2
-  parameter_group_name       = "default.redis7"
-  subnet_group_name          = "airflow-redis-cache-subnet-group"
-  multi_az_enabled           = true
-  snapshot_retention_limit   = 7
+  engine_version             = var.redis_engine_version
+  node_type                  = var.redis_node_type
+  num_cache_clusters         = var.redis_num_cache_clusters
+  parameter_group_name       = var.redis_parameter_group_name
+  subnet_group_name          = "${local.name_prefix}-redis-cache-subnet-group"
+  multi_az_enabled           = var.redis_multi_az_enabled
+  snapshot_retention_limit   = var.redis_snapshot_retention_limit
   snapshot_window            = "03:00-05:00"
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   auth_token_enabled         = true
-  auth_token                 = tostring(data.vault_generic_secret.redis.data["auth_token"])
+  auth_token                 = local.redis_auth_token
   log_delivery_configuration = [
     {
       destination      = module.redis_slow_log_group.name
@@ -801,20 +807,17 @@ module "airflow_redis_cache" {
       log_type         = "slow-log"
     }
   ]
-  subnet_group_ids = [
-    module.vpc.elasticache_subnets[0],
-    module.vpc.elasticache_subnets[1],
-    module.vpc.elasticache_subnets[2]
-  ]
+  subnet_group_ids           = module.vpc.elasticache_subnets
   description                = "Airflow Redis Cache Cluster"
-  replication_group_id       = "airflow-redis"
+  replication_group_id       = "${local.name_prefix}-redis"
   vpc_security_group_ids     = [module.airflow_redis_sg.id]
   maintenance_window         = "sun:05:00-sun:09:00"
   port                       = 6379
-  automatic_failover_enabled = true
+  automatic_failover_enabled = var.redis_automatic_failover_enabled
   tags = {
     Name      = "airflow-redis"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -824,11 +827,11 @@ module "airflow_redis_cache" {
 # -----------------------------------------------------------------------------------------
 module "webserver_lb" {
   source                     = "terraform-aws-modules/alb/aws"
-  name                       = "airflow-webserver-lb"
+  name                       = "${local.name_prefix}-webserver-lb"
   load_balancer_type         = "application"
   vpc_id                     = module.vpc.vpc_id
   subnets                    = module.vpc.public_subnets
-  enable_deletion_protection = false
+  enable_deletion_protection = var.alb_deletion_protection
   drop_invalid_header_fields = true
   ip_address_type            = "ipv4"
   internal                   = false
@@ -874,7 +877,8 @@ module "webserver_lb" {
   }
   tags = {
     Name      = "airflow-webserver-lb"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
   depends_on = [
@@ -964,7 +968,8 @@ module "airflow_webserver_task_execution_role" {
     EOF
   tags = {
     Name      = "airflow-webserver-task-execution-role"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -1056,7 +1061,8 @@ module "airflow_scheduler_task_execution_role" {
     EOF
   tags = {
     Name      = "airflow-scheduler-task-execution-role"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -1135,7 +1141,8 @@ module "airflow_worker_task_execution_role" {
     EOF
   tags = {
     Name      = "airflow-worker-task-execution-role"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
@@ -1159,25 +1166,25 @@ resource "aws_iam_role_policy_attachment" "airflow_worker_task_execution_role_po
 # Cloudwatch Log Groups for ECS tasks
 module "webserver_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
-  log_group_name    = "/aws/ecs/airflow/webserver"
-  retention_in_days = 7
+  log_group_name    = "/aws/ecs/${local.name_prefix}/webserver"
+  retention_in_days = var.log_retention_in_days
 }
 
 module "scheduler_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
-  log_group_name    = "/aws/ecs/airflow/scheduler"
-  retention_in_days = 7
+  log_group_name    = "/aws/ecs/${local.name_prefix}/scheduler"
+  retention_in_days = var.log_retention_in_days
 }
 
 module "worker_log_group" {
   source            = "./modules/cloudwatch/cloudwatch-log-group"
-  log_group_name    = "/aws/ecs/airflow/worker"
-  retention_in_days = 7
+  log_group_name    = "/aws/ecs/${local.name_prefix}/worker"
+  retention_in_days = var.log_retention_in_days
 }
 
 # Add after your ECS cluster module
 resource "aws_ecs_task_definition" "airflow_db_init" {
-  family                   = "airflow-db-init"
+  family                   = "${local.name_prefix}-db-init"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "1024"
@@ -1188,7 +1195,7 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
   container_definitions = jsonencode([
     {
       name      = "db-init"
-      image     = "apache/airflow:2.10.4"
+      image     = var.airflow_image
       essential = true
       command   = ["db", "migrate"]
       linuxParameters = { # ← ADD HERE
@@ -1216,13 +1223,14 @@ resource "aws_ecs_task_definition" "airflow_db_init" {
   ])
   tags = {
     Name      = "airflow-db-init"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
 
 resource "aws_ecs_task_definition" "airflow_create_user" {
-  family                   = "airflow-create-user"
+  family                   = "${local.name_prefix}-create-user"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "1024"
@@ -1233,7 +1241,7 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
   container_definitions = jsonencode([
     {
       name      = "create-user"
-      image     = "apache/airflow:2.10.4"
+      image     = var.airflow_image
       essential = true
       linuxParameters = { # ← ADD HERE
         tmpfs = [
@@ -1247,8 +1255,8 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
         "--firstname", "Admin",
         "--lastname", "User",
         "--role", "Admin",
-        "--email", "admin@example.com",
-        "--password", "admin123"
+        "--email", var.airflow_admin_email,
+        "--password", local.airflow_admin_pass
       ]
 
       # environment = [
@@ -1268,21 +1276,23 @@ resource "aws_ecs_task_definition" "airflow_create_user" {
   ])
   tags = {
     Name      = "airflow-create-user"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
 }
 
 module "ha_airflow_ecs_cluster" {
-  source       = "terraform-aws-modules/ecs/aws"
-  cluster_name = "ha-airflow-ecs-cluster"
+  source                     = "terraform-aws-modules/ecs/aws"
+  cluster_name               = "${local.name_prefix}-ecs-cluster"
+  cluster_capacity_providers = ["FARGATE", "FARGATE_SPOT"]
   services = {
     webserver = {
-      cpu                    = 1024
-      memory                 = 2048
+      cpu                    = var.webserver_cpu
+      memory                 = var.webserver_memory
       task_exec_iam_role_arn = module.airflow_webserver_task_execution_role.arn
       iam_role_arn           = module.airflow_webserver_task_execution_role.arn
-      desired_count          = 2
+      desired_count          = var.webserver_desired_count
       launch_type            = "FARGATE"
       assign_public_ip       = false
       deployment_controller = {
@@ -1331,10 +1341,10 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         webserver = {
-          cpu       = 1024
-          memory    = 2048
+          cpu       = var.webserver_cpu
+          memory    = var.webserver_memory
           essential = true
-          image     = "apache/airflow:2.10.4"
+          image     = var.airflow_image
           command   = ["webserver"]
           linuxParameters = { # ← ADD HERE
             tmpfs = [
@@ -1425,11 +1435,11 @@ module "ha_airflow_ecs_cluster" {
     }
 
     scheduler = {
-      cpu                    = 1024
-      memory                 = 2048
+      cpu                    = var.scheduler_cpu
+      memory                 = var.scheduler_memory
       task_exec_iam_role_arn = module.airflow_scheduler_task_execution_role.arn
       iam_role_arn           = module.airflow_scheduler_task_execution_role.arn
-      desired_count          = 1 # IMPORTANT: Only run 1 scheduler at a time
+      desired_count          = var.scheduler_desired_count
       launch_type            = "FARGATE"
       assign_public_ip       = false
       enable_execute_command = true
@@ -1479,10 +1489,10 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         scheduler = {
-          cpu       = 768
-          memory    = 1536
+          cpu       = var.scheduler_container_cpu
+          memory    = var.scheduler_container_memory
           essential = true
-          image     = "apache/airflow:2.10.4"
+          image     = var.airflow_image
           command   = ["scheduler"]
           linuxParameters = { # ← ADD HERE
             tmpfs = [
@@ -1532,7 +1542,7 @@ module "ha_airflow_ecs_cluster" {
             { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING", value = "True" },
 
             # Celery
-            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = tostring(var.worker_concurrency) },
 
             # Scheduler tuning
             { name = "AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC", value = "5" },
@@ -1583,13 +1593,13 @@ module "ha_airflow_ecs_cluster" {
           }
         },
         s3_dag_sync = {
-          cpu        = 256
-          memory     = 512
+          cpu        = var.dag_sync_cpu
+          memory     = var.dag_sync_memory
           essential  = false
-          image      = "public.ecr.aws/aws-cli/aws-cli:2.22.0"
+          image      = var.dag_sync_image
           entryPoint = ["/bin/bash", "-c"]
           command = [
-            "while true; do aws s3 sync s3://${module.airflow_dags_bucket.bucket}/dags/ /opt/airflow/dags/ --delete; sleep 30; done"
+            "while true; do aws s3 sync s3://${module.airflow_dags_bucket.bucket}/dags/ /opt/airflow/dags/ --delete; sleep ${var.dag_sync_interval}; done"
           ]
           mountPoints = [
             {
@@ -1611,11 +1621,11 @@ module "ha_airflow_ecs_cluster" {
     }
 
     worker = {
-      cpu                    = 1024
-      memory                 = 2048
+      cpu                    = var.worker_cpu
+      memory                 = var.worker_memory
       task_exec_iam_role_arn = module.airflow_worker_task_execution_role.arn
       iam_role_arn           = module.airflow_worker_task_execution_role.arn
-      desired_count          = 2
+      desired_count          = var.worker_desired_count
       launch_type            = "FARGATE"
       assign_public_ip       = false
       deployment_controller = {
@@ -1664,10 +1674,10 @@ module "ha_airflow_ecs_cluster" {
 
       container_definitions = {
         worker = {
-          cpu       = 1024
-          memory    = 2048
+          cpu       = var.worker_cpu
+          memory    = var.worker_memory
           essential = true
-          image     = "apache/airflow:2.10.4"
+          image     = var.airflow_image
           command   = ["celery", "worker"]
           linuxParameters = {
             tmpfs = [
@@ -1700,7 +1710,7 @@ module "ha_airflow_ecs_cluster" {
             }
           ]
           environment = concat(local.common_env, [
-            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "16" },
+            { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = tostring(var.worker_concurrency) },
           ])
           readOnlyRootFilesystem = false
           logConfiguration = {
@@ -1727,7 +1737,8 @@ module "ha_airflow_ecs_cluster" {
   }
   tags = {
     Name      = "ha-airflow-ecs-cluster"
-    Project   = "ha-airflow"
+    Project   = var.project_name
+    Environment = var.environment
     ManagedBy = "terraform"
   }
   depends_on = [
@@ -1813,8 +1824,8 @@ resource "null_resource" "airflow_create_user" {
 # -----------------------------------------------------------------------------------------
 module "airflow_webserver_autoscaling_policy" {
   source             = "./modules/autoscaling"
-  min_capacity       = 2
-  max_capacity       = 10
+  min_capacity       = var.webserver_min_capacity
+  max_capacity       = var.webserver_max_capacity
   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["webserver"].name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
@@ -1859,8 +1870,8 @@ module "airflow_webserver_autoscaling_policy" {
 
 module "airflow_scheduler_autoscaling_policy" {
   source             = "./modules/autoscaling"
-  min_capacity       = 1
-  max_capacity       = 1
+  min_capacity       = var.scheduler_desired_count
+  max_capacity       = var.scheduler_desired_count
   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["scheduler"].name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
@@ -1869,8 +1880,8 @@ module "airflow_scheduler_autoscaling_policy" {
 
 module "airflow_worker_autoscaling_policy" {
   source             = "./modules/autoscaling"
-  min_capacity       = 2
-  max_capacity       = 10
+  min_capacity       = var.worker_min_capacity
+  max_capacity       = var.worker_max_capacity
   resource_id        = "service/${module.ha_airflow_ecs_cluster.cluster_name}/${module.ha_airflow_ecs_cluster.services["worker"].name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
@@ -1918,14 +1929,14 @@ module "airflow_worker_autoscaling_policy" {
 # -----------------------------------------------------------------------------------------
 module "rds_cpu" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
-  alarm_name          = "airflow-rds-high-cpu"
+  alarm_name          = "${local.name_prefix}-rds-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
   metric_name         = "CPUUtilization"
   namespace           = "AWS/RDS"
   period              = "300"
   statistic           = "Average"
-  threshold           = "80"
+  threshold           = var.rds_cpu_threshold
   alarm_description   = "RDS CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
@@ -1935,14 +1946,14 @@ module "rds_cpu" {
 
 module "rds_connections" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
-  alarm_name          = "airflow-rds-high-connections"
+  alarm_name          = "${local.name_prefix}-rds-high-connections"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
   metric_name         = "DatabaseConnections"
   namespace           = "AWS/RDS"
   period              = "300"
   statistic           = "Average"
-  threshold           = "400"
+  threshold           = var.rds_connections_threshold
   alarm_description   = "RDS connection count is too high"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
@@ -1952,14 +1963,14 @@ module "rds_connections" {
 
 module "redis_cpu" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
-  alarm_name          = "airflow-redis-high-cpu"
+  alarm_name          = "${local.name_prefix}-redis-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
   metric_name         = "CPUUtilization"
   namespace           = "AWS/ElastiCache"
   period              = "300"
   statistic           = "Average"
-  threshold           = "75"
+  threshold           = var.redis_cpu_threshold
   alarm_description   = "Redis CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
@@ -1969,14 +1980,14 @@ module "redis_cpu" {
 
 module "scheduler_cpu" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
-  alarm_name          = "airflow-scheduler-high-cpu"
+  alarm_name          = "${local.name_prefix}-scheduler-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
   metric_name         = "CPUUtilization"
   namespace           = "AWS/ECS"
   period              = "300"
   statistic           = "Average"
-  threshold           = "80"
+  threshold           = var.scheduler_cpu_threshold
   alarm_description   = "Scheduler CPU utilization is too high"
   alarm_actions       = [module.alarm_notifications.arn]
   dimensions = {
@@ -1987,7 +1998,7 @@ module "scheduler_cpu" {
 
 module "alb_unhealthy_targets" {
   source              = "./modules/cloudwatch/cloudwatch-alarm"
-  alarm_name          = "airflow-alb-unhealthy-targets"
+  alarm_name          = "${local.name_prefix}-alb-unhealthy-targets"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = "2"
   metric_name         = "UnHealthyHostCount"
@@ -2080,7 +2091,8 @@ module "alb_unhealthy_targets" {
 
 #   tags = {
 #     Name      = "airflow-lb-webserver-waf"
-#     Project   = "ha-airflow"
+#     Project     = var.project_name
+#     Environment = var.environment
 #     ManagedBy = "terraform"
 #   }
 # }
